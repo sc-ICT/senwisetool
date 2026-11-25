@@ -13,7 +13,8 @@ class NotificationService:
         link: Optional[str] = None,
         type: str = "info",
         user_id: Optional[int] = None,
-        target_role: Optional[str] = None
+        target_role: Optional[str] = None,
+        commit: bool = True
     ) -> Notification:
         """
         Crée une notification en base de données pour un utilisateur spécifique ou un rôle (ex: superadmin).
@@ -28,8 +29,11 @@ class NotificationService:
             is_read=False
         )
         db.add(notification)
-        await db.commit()
-        await db.refresh(notification)
+        if commit:
+            await db.commit()
+            await db.refresh(notification)
+        else:
+            await db.flush()
         return notification
 
     async def get_user_notifications(

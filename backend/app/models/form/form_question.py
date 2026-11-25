@@ -16,7 +16,7 @@ from app.db.database import Base
 
 
 class QuestionType(str, enum.Enum):
-    # 1. Basique / Saisie Standard (Types simples)
+    # 1. Basique / Saisie Standard
     TEXT_SHORT = "text_short"
     TEXT_LONG = "text_long"
     NUMBER_INTEGER = "number_integer"
@@ -55,13 +55,14 @@ class QuestionType(str, enum.Enum):
     GPS_POINT = "gps_point"
     GPS_POLYGON = "gps_polygon"
     QR_BARCODE = "qr_barcode"
+    LOCATION = "location"  # Localisation Administrative & Géographique Progressive (Pays -> Divisions -> Point GPS)
 
     # 8. Types Composés, Audit & Référentiels
     AUDIT_COMPLIANCE = "audit_compliance"
     FORMULA_CALCULATED = "formula_calculated"
     MATRIX_GRID = "matrix_grid"
     RESOURCE_LOOKUP = "resource_lookup"
-
+    CROSS_FORM_LOOKUP = "cross_form_lookup"
 
 
 class FormQuestion(Base):
@@ -70,6 +71,9 @@ class FormQuestion(Base):
     id = Column(Integer, primary_key=True, index=True)
     form_id = Column(
         Integer, ForeignKey("forms.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    form_version_id = Column(
+        Integer, ForeignKey("form_versions.id", ondelete="CASCADE"), nullable=True, index=True
     )
     section_id = Column(
         Integer, ForeignKey("form_sections.id", ondelete="CASCADE"), nullable=True, index=True
@@ -84,10 +88,10 @@ class FormQuestion(Base):
     order_index = Column(Integer, nullable=False, default=0)
     is_required = Column(Boolean, nullable=False, default=True)
     is_readonly = Column(Boolean, nullable=False, default=False)
-    is_sanctuarized = Column(Boolean, nullable=False, default=False)  # Critère obligatoire imposé par le modèle Super Admin
+    is_sanctuarized = Column(Boolean, nullable=False, default=False)
 
     # Paramètres de scoring et conformité
-    is_critical = Column(Boolean, nullable=False, default=False)  # Non-conformité majeure = blocage
+    is_critical = Column(Boolean, nullable=False, default=False)
     weight = Column(Numeric(5, 2), nullable=False, default=1.0)
     scoring_config = Column(JSON, nullable=True, default=lambda: {
         "compliant_score": 100.0,
@@ -96,33 +100,11 @@ class FormQuestion(Base):
         "require_proof_on_fail": True
     })
 
-    # Options statiques (pour radio, select, multi)
-    # [{"label": "...", "value": "...", "points": 10, "is_critical_trigger": false}]
     options = Column(JSON, nullable=True, default=list)
-
-    # Configuration de liaison dynamique avec une Ressource (type resource_lookup)
-    # {
-    #   "resource_id": 14,
-    #   "resource_code": "planters_registry",
-    #   "label_field": "full_name",
-    #   "value_field": "farmer_id",
-    #   "secondary_label_field": "village",
-    #   "filter_criteria": {"status": "active"},
-    #   "cascade_autofill": {"Q_VILLAGE": "village", "Q_NATIONAL_ID": "cin_number"}
-    # }
     resource_binding = Column(JSON, nullable=True, default=dict)
-
-    # Formule mathématique ou logique pour FORMULA_CALCULATED
-    # Ex: "ROUND({Q_GROSS_WEIGHT} * (1 - ({Q_MOISTURE} - 12)/100), 2)"
     formula_expression = Column(String(500), nullable=True)
-
-    # Règles de validation technique (min, max, regex, formats autorisés, résolution GPS min)
     validation_rules = Column(JSON, nullable=True, default=dict)
-
-    # Règles de conditions & dépendances universelles (Nœud vers Nœud)
-    # Conditionnée par rapport à une autre question OU une autre section / sous-section
     dependency_rules = Column(JSON, nullable=True, default=dict)
-
     settings = Column(JSON, nullable=True, default=dict)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
@@ -131,6 +113,6 @@ class FormQuestion(Base):
     )
 
     # Relations
-    form = relationship("Form", back_populates="questions", lazy="joined")
+    form = relationship("Form", lazy="joined")
+    version = relationship("FormVersion", back_populates="questions", lazy="joined")
     section = relationship("FormSection", back_populates="questions", lazy="joined")
-    answers = relationship("SubmissionAnswer", back_populates="question", cascade="all, delete-orphan", lazy="selectin")

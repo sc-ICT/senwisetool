@@ -9,6 +9,8 @@ from app.schemas.project.project import (
     ProjectCreate,
     ProjectUpdate,
     ProjectResponse,
+    ProjectVersionCloneRequest,
+    ProjectVersionUpdate,
 )
 from app.services.project.project_service import ProjectService
 
@@ -17,17 +19,15 @@ router = APIRouter()
 
 async def resolve_org_id(db: AsyncSession, current_user: User, org_id: Optional[int] = None) -> Optional[int]:
     """
-    Résout de manière souveraine et sécurisée l'organisation de rattachement :
-    1. Si Super Admin et org_id explicite fourni, cible cette organisation.
-    2. Si l'attribut organization_id est présent sur l'objet (ex: mocks de tests unitaires).
-    3. Résolution dynamique via organization_service (propriétaire, contact ou membre).
-    4. None si Super Admin hors d'un tenant (modèle global / blueprint de studio).
+    Résout de manière souveraine l'organisation de l'utilisateur :
+    1. Si Super Admin avec org_id explicite.
+    2. Si l'attribut organization_id est sur l'utilisateur.
+    3. Résolution dynamique via organization_service.
     """
     is_super_admin = current_user.role == UserRole.SUPER_ADMIN
-    if is_super_admin and org_id is not None:
+    if is_super_admin:
         return org_id
 
-    # Fallback pour mocks ou objets avec organization_id direct
     direct_org_id = getattr(current_user, "organization_id", None)
     if direct_org_id is not None:
         return direct_org_id
@@ -40,13 +40,11 @@ async def resolve_org_id(db: AsyncSession, current_user: User, org_id: Optional[
         return None
 
 
-@router.get("", response_model=List[ProjectResponse], summary="Lister les projets ou modèles accessibles")
+@router.get("", response_model=List[ProjectResponse], summary="Lister les projets disponibles")
 async def list_projects(
-    category: Optional[str] = Query(None, description="Filtre par catégorie"),
     project_type: Optional[str] = Query(None, description="Filtre par type de projet"),
     status: Optional[str] = Query(None, description="Filtre par statut"),
-    is_template: Optional[bool] = Query(None, description="Filtrer les modèles de projets (True) ou les projets opérationnels (False)"),
-    search: Optional[str] = Query(None, description="Recherche par nom ou code"),
+    search: Optional[str] = Query(None, description="Recherche par nom, code ou description"),
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=100),
     org_id: Optional[int] = Query(None, description="Organisation ciblée (Super Admin uniquement)"),
@@ -60,9 +58,8 @@ async def list_projects(
         db=db,
         organization_id=target_org_id,
         is_super_admin=is_super_admin,
-        is_template=is_template,
         status_filter=status,
-        category_filter=category,
+        project_type=project_type,
         search=search,
         skip=skip,
         limit=limit,
@@ -70,36 +67,7 @@ async def list_projects(
     return projects
 
 
-@router.post("/{template_id}/instantiate", response_model=ProjectResponse, status_code=status.HTTP_201_CREATED, summary="Instancier un projet opérationnel depuis un modèle certifié")
-async def instantiate_project(
-    template_id: int,
-    name_override: Optional[str] = Query(None, description="Surcharge du nom du projet"),
-    code_override: Optional[str] = Query(None, description="Surcharge du code technique"),
-    org_id: Optional[int] = Query(None, description="Organisation ciblée (Super Admin uniquement)"),
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """
-    Instancie pour l'organisation cliente un projet complet à partir du modèle de projet (blueprint)
-    conçu par le Super Admin, en clonant fidèlement ses formulaires, sections sanctuarisées,
-    questions critiques, formules et liaisons de ressources.
-    """
-    target_org_id = await resolve_org_id(db, current_user, org_id)
-    if not target_org_id:
-        raise HTTPException(status_code=400, detail="Une organisation doit être spécifiée pour instancier un projet opérationnel.")
-
-    instantiated = await ProjectService.instantiate_project_from_template(
-        db=db,
-        template_id=template_id,
-        organization_id=target_org_id,
-        user_id=current_user.id,
-        name_override=name_override,
-        code_override=code_override,
-    )
-    return instantiated
-
-
-@router.post("", response_model=ProjectResponse, status_code=status.HTTP_201_CREATED, summary="Créer un nouveau projet ou modèle de projet")
+@router.post("", response_model=ProjectResponse, status_code=status.HTTP_201_CREATED, summary="Créer un nouveau projet")
 async def create_project(
     payload: ProjectCreate,
     org_id: Optional[int] = Query(None, description="Organisation ciblée (Super Admin uniquement)"),
@@ -174,7 +142,78 @@ async def delete_project(
     return None
 
 
-@router.post("/{project_id}/publish", response_model=ProjectResponse, summary="Publier un modèle de projet (vérifie que tous les formulaires sont publiés)")
+@router.post("/{project_id}/versions/clone", response_model=ProjectResponse, status_code=status.HTTP_201_CREATED, summary="Cloner une version existante pour créer une nouvelle version")
+async def clone_project_version(
+    project_id: int,
+    payload: ProjectVersionCloneRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    is_super_admin = current_user.role == UserRole.SUPER_ADMIN
+    target_org_id = await resolve_org_id(db, current_user)
+    await ProjectService.clone_project_version(
+        db=db,
+        project_id=project_id,
+        req=payload,
+        organization_id=target_org_id,
+        user_id=current_user.id,
+        is_super_admin=is_super_admin,
+    )
+    # Renvoyer le projet avec ses versions actualisées
+    return await ProjectService.get_project_by_id(
+        db=db,
+        project_id=project_id,
+        organization_id=target_org_id,
+        is_super_admin=is_super_admin,
+    )
+
+
+@router.post("/{project_id}/versions/{version_id}/publish", response_model=ProjectResponse, summary="Publier une version spécifique d'un projet")
+async def publish_project_version(
+    project_id: int,
+    version_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    is_super_admin = current_user.role == UserRole.SUPER_ADMIN
+    target_org_id = await resolve_org_id(db, current_user)
+    await ProjectService.publish_project_version(
+        db=db,
+        project_id=project_id,
+        version_id=version_id,
+        organization_id=target_org_id,
+        user_id=current_user.id,
+        is_super_admin=is_super_admin,
+    )
+    return await ProjectService.get_project_by_id(
+        db=db,
+        project_id=project_id,
+        organization_id=target_org_id,
+        is_super_admin=is_super_admin,
+    )
+
+
+@router.put("/{project_id}/versions/{version_id}", response_model=ProjectResponse, summary="Mettre à jour les paramètres d'une version spécifique d'un projet")
+async def update_project_version(
+    project_id: int,
+    version_id: int,
+    payload: ProjectVersionUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    is_super_admin = current_user.role == UserRole.SUPER_ADMIN
+    target_org_id = await resolve_org_id(db, current_user)
+    return await ProjectService.update_project_version(
+        db=db,
+        project_id=project_id,
+        version_id=version_id,
+        data=payload,
+        organization_id=target_org_id,
+        is_super_admin=is_super_admin,
+    )
+
+
+@router.post("/{project_id}/publish", response_model=ProjectResponse, summary="Publier la version la plus récente d'un projet")
 async def publish_project(
     project_id: int,
     db: AsyncSession = Depends(get_db),
@@ -182,41 +221,23 @@ async def publish_project(
 ):
     is_super_admin = current_user.role == UserRole.SUPER_ADMIN
     target_org_id = await resolve_org_id(db, current_user)
-    return await ProjectService.publish_project(
+    project = await ProjectService.get_project_by_id(db, project_id, target_org_id, is_super_admin)
+    if not project:
+        raise HTTPException(status_code=404, detail="Projet introuvable.")
+
+    if not project.versions:
+        raise HTTPException(status_code=400, detail="Ce projet ne possède aucune version à publier.")
+
+    latest_version = project.versions[0]
+    await ProjectService.publish_project_version(
         db=db,
         project_id=project_id,
+        version_id=latest_version.id,
         organization_id=target_org_id,
-        is_super_admin=is_super_admin,
-    )
-
-
-@router.post("/{project_id}/new-version", response_model=ProjectResponse, status_code=status.HTTP_201_CREATED, summary="Créer une nouvelle version (brouillon) d'un projet publié")
-async def create_new_project_version(
-    project_id: int,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    is_super_admin = current_user.role == UserRole.SUPER_ADMIN
-    target_org_id = await resolve_org_id(db, current_user)
-    return await ProjectService.create_new_project_version(
-        db=db,
-        project_id=project_id,
-        organization_id=target_org_id,
-        is_super_admin=is_super_admin,
         user_id=current_user.id,
+        is_super_admin=is_super_admin,
     )
-
-
-
-@router.get("/{project_id}/export-blueprint", summary="Exporter un modèle de projet en package JSON complet (Blueprint)")
-async def export_blueprint(
-    project_id: int,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    is_super_admin = current_user.role == UserRole.SUPER_ADMIN
-    target_org_id = await resolve_org_id(db, current_user)
-    return await ProjectService.export_project_blueprint(
+    return await ProjectService.get_project_by_id(
         db=db,
         project_id=project_id,
         organization_id=target_org_id,
@@ -224,12 +245,31 @@ async def export_blueprint(
     )
 
 
-@router.post("/import-blueprint", response_model=ProjectResponse, status_code=status.HTTP_201_CREATED, summary="Importer un modèle de projet depuis un package JSON")
+@router.delete("/{project_id}/versions/{version_id}", summary="Supprimer une version d'un projet")
+async def delete_project_version(
+    project_id: int,
+    version_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    is_super_admin = current_user.role == UserRole.SUPER_ADMIN
+    target_org_id = await resolve_org_id(db, current_user)
+    result = await ProjectService.delete_project_version(
+        db=db,
+        project_id=project_id,
+        version_id=version_id,
+        organization_id=target_org_id,
+        is_super_admin=is_super_admin,
+    )
+    return result
+
+
+@router.post("/import-blueprint", response_model=ProjectResponse, status_code=status.HTTP_201_CREATED, summary="Importer un projet depuis un package JSON Blueprint")
 async def import_blueprint(
     blueprint_data: Dict[str, Any],
-    org_id: Optional[int] = Query(None, description="Organisation ciblée (Super Admin uniquement)"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    org_id: Optional[int] = Query(None, description="Organisation ciblée (Super Admin uniquement)"),
 ):
     is_super_admin = current_user.role == UserRole.SUPER_ADMIN
     target_org_id = await resolve_org_id(db, current_user, org_id)
@@ -242,7 +282,25 @@ async def import_blueprint(
     )
 
 
-@router.get("/{project_id}/export-compliance", summary="Exporter le rapport d'audit et de conformité réglementaire")
+@router.get("/{project_id}/export-blueprint", summary="Exporter un projet en package JSON")
+async def export_blueprint(
+    project_id: int,
+    version: Optional[str] = Query(None, description="Numéro de version spécifique à exporter (ex: '1.0.0') ou 'all' pour toutes les versions"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    is_super_admin = current_user.role == UserRole.SUPER_ADMIN
+    target_org_id = await resolve_org_id(db, current_user)
+    return await ProjectService.export_project_blueprint(
+        db=db,
+        project_id=project_id,
+        organization_id=target_org_id,
+        version_number=version,
+        is_super_admin=is_super_admin,
+    )
+
+
+@router.get("/{project_id}/export-compliance", summary="Exporter le rapport d'audit et de conformité du projet")
 async def export_compliance(
     project_id: int,
     db: AsyncSession = Depends(get_db),
@@ -256,3 +314,69 @@ async def export_compliance(
         organization_id=target_org_id,
         is_super_admin=is_super_admin,
     )
+
+
+# =============================================================================
+# ASSOCIATIONS DE FORMULAIRES AU PROJET (PAR VERSION, STRICTEMENT PUBLIÉS)
+# =============================================================================
+
+@router.get("/{project_id}/forms", summary="Lister les formulaires associés à un projet ou à sa version")
+async def list_project_forms(
+    project_id: int,
+    project_version_id: Optional[int] = Query(None, description="Filtrer par version de projet"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    is_super_admin = current_user.role == UserRole.SUPER_ADMIN
+    target_org_id = await resolve_org_id(db, current_user)
+    return await ProjectService.get_project_forms(
+        db=db,
+        project_id=project_id,
+        project_version_id=project_version_id,
+        organization_id=target_org_id,
+        is_super_admin=is_super_admin,
+    )
+
+
+@router.post("/{project_id}/forms/attach/{form_id}", summary="Associer une version de formulaire publiée à une version de projet")
+async def attach_form_to_project(
+    project_id: int,
+    form_id: int,
+    form_version_id: Optional[int] = Query(None, description="ID de la version de formulaire publiée (interdit en draft)"),
+    project_version_id: Optional[int] = Query(None, description="ID de la version du projet cible"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    is_super_admin = current_user.role == UserRole.SUPER_ADMIN
+    target_org_id = await resolve_org_id(db, current_user)
+    return await ProjectService.attach_form_to_project(
+        db=db,
+        project_id=project_id,
+        form_id=form_id,
+        form_version_id=form_version_id,
+        project_version_id=project_version_id,
+        user=current_user,
+        organization_id=target_org_id,
+        is_super_admin=is_super_admin,
+    )
+
+
+@router.delete("/{project_id}/forms/detach/{form_id}", status_code=status.HTTP_204_NO_CONTENT, summary="Dissocier un formulaire d'un projet")
+async def detach_form_from_project(
+    project_id: int,
+    form_id: int,
+    project_version_id: Optional[int] = Query(None, description="ID de la version du projet"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    is_super_admin = current_user.role == UserRole.SUPER_ADMIN
+    target_org_id = await resolve_org_id(db, current_user)
+    await ProjectService.detach_form_from_project(
+        db=db,
+        project_id=project_id,
+        form_id=form_id,
+        project_version_id=project_version_id,
+        organization_id=target_org_id,
+        is_super_admin=is_super_admin,
+    )
+    return None

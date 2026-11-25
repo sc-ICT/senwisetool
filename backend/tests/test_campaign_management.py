@@ -6,7 +6,7 @@ from app.models.user.user import User, UserRole, UserStatus
 from app.models.organization.organization import Organization, OrgStatusEnum
 from app.models.organization.member import OrganizationMember
 from app.models.organization.role import OrganizationRole
-from app.models.campaign.campaign import Campaign, CampaignStatus, CampaignType
+from app.models.campaign.campaign import Campaign, CampaignStatus
 
 
 @pytest.mark.asyncio
@@ -279,7 +279,8 @@ async def test_campaign_lifecycle_and_tenant_isolation(async_client: AsyncClient
 @pytest.mark.asyncio
 async def test_shared_and_immutable_tools_governance(async_client: AsyncClient, setup_db):
     from tests.conftest import TestingSessionLocal
-    from app.models.plugin.plugin import Plugin, PluginVersion, PluginStatus, PluginVersionStatus, OrganizationPlugin, OrgPluginStatus
+    from app.models.plugin.plugin import Plugin, PluginVersion, PluginStatus, PluginVersionStatus, OrgPluginStatus
+    from app.models.organization.organization_plugin import OrganizationPlugin
 
     async with TestingSessionLocal() as session:
         # 1. Super Admin, User Org A et User Org B

@@ -55,10 +55,8 @@ TOOL_CATALOG: List[Dict[str, Any]] = [
         "available_immutable_fields": [
             {"field": "name", "label": "Nom de la campagne"},
             {"field": "code", "label": "Slug / Code technique"},
-            {"field": "campaign_type", "label": "Type d'opération"},
-            {"field": "target_forms", "label": "Formulaires liés obligatoires"},
+            {"field": "visibility", "label": "Visibilité (Publique / Privée)"},
             {"field": "dates", "label": "Période (Dates de début et fin)"},
-            {"field": "targets", "label": "Objectifs chiffrés réglementaires"},
         ],
         "default_config": {
             "distribution_mode": "tenant",
@@ -77,7 +75,7 @@ TOOL_CATALOG: List[Dict[str, Any]] = [
             "allow_import": False,
             "allow_archive": True,
             "is_immutable": False,
-            "immutable_fields": ["campaign_type", "target_forms", "code"]
+            "immutable_fields": ["code"]
         }
     },
     {

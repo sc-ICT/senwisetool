@@ -88,21 +88,25 @@ class StorageService:
 
     def build_resource_media_path(
         self,
-        org_id: int,
+        org_id: Any,
         resource_id: int,
         media_type: str,
         filename: str,
-        item_key: Optional[str] = None
+        item_key: Optional[str] = None,
+        user_id: Optional[int] = None,
     ) -> str:
         """
-        Construit le chemin relatif pour un média lié à une ressource :
-        organizations/{org_id}/tools/resources/{resource_id}/{media_type}/{unique_id}_{filename}
+        Construit le chemin relatif pour un média lié à une ressource et à l'utilisateur :
+        organizations/{org_id}/users/{user_id}/resources/{resource_id}/{media_type}/{unique_id}_{filename}
         """
         clean_name = self.sanitize_filename(filename)
         prefix = f"{item_key}_" if item_key else ""
         unique_slug = f"{prefix}{uuid.uuid4().hex[:8]}_{clean_name}"
         clean_media_type = (media_type or "files").lower().replace(" ", "_")
-        return f"organizations/{org_id}/tools/resources/{resource_id}/{clean_media_type}/{unique_slug}"
+        target_org = org_id or "shared"
+        if user_id:
+            return f"organizations/{target_org}/users/{user_id}/resources/{resource_id}/{clean_media_type}/{unique_slug}"
+        return f"organizations/{target_org}/tools/resources/{resource_id}/{clean_media_type}/{unique_slug}"
 
     def build_org_global_path(self, org_id: int, category: str, filename: str) -> str:
         """

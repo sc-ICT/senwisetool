@@ -17,6 +17,7 @@ from app.db.database import Base
 
 class ResourceStatus(str, enum.Enum):
     DRAFT = "draft"
+    PUBLISHED = "published"
     ACTIVE = "active"
     ARCHIVED = "archived"
 
@@ -42,8 +43,10 @@ class Resource(Base):
 
     name = Column(String(255), nullable=False, index=True)
     code = Column(String(100), nullable=False, index=True)
-    description = Column(Text, nullable=True)
     category = Column(String(100), nullable=False, default="general", index=True)
+    visibility = Column(String(50), nullable=False, default="public", index=True)
+    authorized_organization_ids = Column(JSON, nullable=True, default=list)
+    cover_image_url = Column(Text, nullable=True)
     icon = Column(String(50), nullable=False, default="Database")
     status = Column(String(50), nullable=False, default=ResourceStatus.DRAFT.value, index=True)
 
@@ -52,10 +55,8 @@ class Resource(Base):
     is_lts = Column(Boolean, nullable=False, default=False, index=True)
     schema_history = Column(JSON, nullable=True, default=list)
 
-    # Schéma dynamique des champs de la ressource
-    # Liste de dicts: [{"name": "...", "label": "...", "type": "...", "required": bool, "unique": bool, "options": [...], "default_value": ...}]
+    description = Column(Text, nullable=True)
     schema_fields = Column(JSON, nullable=False, default=list)
-
     settings = Column(JSON, nullable=True, default=dict)
     metrics = Column(JSON, nullable=True, default=lambda: {"item_count": 0})
 
@@ -73,4 +74,11 @@ class Resource(Base):
     organization = relationship("Organization", lazy="joined")
     plugin = relationship("Plugin", lazy="selectin")
     created_by = relationship("User", foreign_keys=[created_by_id], lazy="selectin")
+    versions = relationship(
+        "ResourceVersion",
+        back_populates="resource",
+        cascade="all, delete-orphan",
+        order_by="desc(ResourceVersion.id)",
+        lazy="selectin"
+    )
     items = relationship("ResourceItem", back_populates="resource", cascade="all, delete-orphan", lazy="selectin")

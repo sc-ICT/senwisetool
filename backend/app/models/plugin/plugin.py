@@ -37,6 +37,8 @@ class Plugin(Base):
     author = Column(String(100), nullable=False, default="SenWiseTool")
     status = Column(String(30), nullable=False, default=PluginStatus.DRAFT.value, index=True)
     tags = Column(JSON, nullable=True, default=list)
+    is_public = Column(Boolean, nullable=False, default=True, index=True)
+    allowed_organization_ids = Column(JSON, nullable=True, default=list)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
@@ -46,9 +48,9 @@ class Plugin(Base):
         "PluginVersion",
         back_populates="plugin",
         cascade="all, delete-orphan",
-        order_by="desc(PluginVersion.id)"
+        order_by="desc(PluginVersion.id)",
+        lazy="selectin"
     )
-    installations = relationship("OrganizationPlugin", back_populates="plugin")
 
 
     def __repr__(self) -> str:
@@ -83,7 +85,13 @@ class PluginVersion(Base):
     # Relations
     plugin = relationship("Plugin", back_populates="versions")
     published_by = relationship("User", foreign_keys=[published_by_id])
-    installations = relationship("OrganizationPlugin", back_populates="installed_version")
+    tools = relationship(
+        "PluginVersionTool",
+        back_populates="version",
+        cascade="all, delete-orphan",
+        order_by="PluginVersionTool.id",
+        lazy="selectin"
+    )
 
     __table_args__ = (
         UniqueConstraint("plugin_id", "version_number", name="uq_plugin_version_number"),
@@ -93,37 +101,59 @@ class PluginVersion(Base):
         return f"<PluginVersion id={self.id} plugin_id={self.plugin_id} version={self.version_number} status={self.status}>"
 
 
-class OrganizationPlugin(Base):
-    __tablename__ = "organization_plugins"
+class PluginVersionTool(Base):
+    __tablename__ = "plugin_version_tools"
 
     id = Column(Integer, primary_key=True, index=True)
-    organization_id = Column(Integer, ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True)
-    plugin_id = Column(Integer, ForeignKey("plugins.id", ondelete="RESTRICT"), nullable=False, index=True)
-    installed_version_id = Column(Integer, ForeignKey("plugin_versions.id", ondelete="RESTRICT"), nullable=False, index=True)
+    plugin_version_id = Column(Integer, ForeignKey("plugin_versions.id", ondelete="CASCADE"), nullable=False, index=True)
+    item_key = Column(String(100), nullable=False, index=True)
+    tool_code = Column(String(50), nullable=False, index=True)
+    type = Column(String(30), nullable=False, default="module")  # 'feature' ou 'module'
+    config_target = Column(String(30), nullable=False, default="tool_resource")  # 'tool_global' ou 'tool_resource'
+    name = Column(String(200), nullable=False)
+    description = Column(Text, nullable=True)
+    selected_resource_id = Column(Integer, nullable=True)
+    selected_resource_code = Column(String(100), nullable=True)
+    selected_resource_name = Column(String(200), nullable=True)
+    selected_resource_status = Column(String(50), nullable=True)
+    distribution_mode = Column(String(50), nullable=False, default="tenant")
+    permissions_mode = Column(String(50), nullable=False, default="restricted")
+    parameters = Column(JSON, nullable=False, default=dict)
 
-    status = Column(String(30), nullable=False, default=OrgPluginStatus.INSTALLED.value, index=True)
-
-    # Traçabilité juridique de la politique d'utilisation
-    policy_accepted_at = Column(DateTime(timezone=True), nullable=False)
-    policy_accepted_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
-    policy_version = Column(String(50), nullable=False)
-
-    # Paramètres locaux et configurations spécifiques à l'organisation
-    local_settings = Column(JSON, nullable=True, default=dict)
-
-    installed_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
-    # Relations
-    organization = relationship("Organization")
-    plugin = relationship("Plugin", back_populates="installations")
-    installed_version = relationship("PluginVersion", foreign_keys=[installed_version_id], back_populates="installations")
-    policy_accepted_by = relationship("User", foreign_keys=[policy_accepted_by_user_id])
+    version = relationship("PluginVersion", back_populates="tools")
 
-    # Contrainte absolue : 1 organisation ne peut intégrer un même plugin qu'une seule fois
     __table_args__ = (
-        UniqueConstraint("organization_id", "plugin_id", name="uq_organization_plugin"),
+        UniqueConstraint("plugin_version_id", "item_key", name="uq_plugin_version_tool_item_key"),
     )
 
+    def to_dict(self) -> dict:
+        params = self.parameters if isinstance(self.parameters, dict) else {}
+        base = {
+            "id": self.id,
+            "item_key": self.item_key,
+            "tool_code": self.tool_code,
+            "type": self.type,
+            "config_target": self.config_target,
+            "name": self.name,
+            "description": self.description or "",
+            "selected_resource_id": self.selected_resource_id,
+            "selected_resource_code": self.selected_resource_code,
+            "selected_resource_name": self.selected_resource_name,
+            "selected_resource_status": self.selected_resource_status,
+            "distribution_mode": self.distribution_mode,
+            "permissions_mode": self.permissions_mode,
+            "parameters": params,
+        }
+        # Fusion des paramètres plats pour compatibilité immédiate avec les clients existants
+        for k, v in params.items():
+            if k not in base:
+                base[k] = v
+        return base
+
     def __repr__(self) -> str:
-        return f"<OrganizationPlugin id={self.id} org_id={self.organization_id} plugin_id={self.plugin_id} version_id={self.installed_version_id} status={self.status}>"
+        return f"<PluginVersionTool id={self.id} version_id={self.plugin_version_id} item_key={self.item_key} tool_code={self.tool_code}>"
+
+

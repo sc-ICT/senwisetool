@@ -1,7 +1,7 @@
 from app.models.plugin.plugin import (
     Plugin,
     PluginVersion,
-    OrganizationPlugin,
+    PluginVersionTool,
     PluginStatus,
     PluginVersionStatus,
     OrgPluginStatus,
@@ -10,7 +10,7 @@ from app.models.plugin.plugin import (
 __all__ = [
     "Plugin",
     "PluginVersion",
-    "OrganizationPlugin",
+    "PluginVersionTool",
     "PluginStatus",
     "PluginVersionStatus",
     "OrgPluginStatus",

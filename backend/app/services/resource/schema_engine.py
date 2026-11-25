@@ -4,6 +4,8 @@ import re
 import json
 import csv
 import zipfile
+import uuid
+import secrets
 from typing import List, Dict, Any, Tuple, Optional
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -128,10 +130,252 @@ def parse_boolean(val: Any) -> bool:
     return s in ["true", "1", "yes", "oui", "vrai", "o", "y"]
 
 
+DOC_SHEET_KEYWORDS = [
+    "guide",
+    "regle",
+    "règle",
+    "regles",
+    "règles",
+    "instruction",
+    "instructions",
+    "types autorises",
+    "types autorisés",
+    "types",
+    "documentation",
+    "aide",
+    "notice",
+]
+
+
+def validate_fields_integrity(fields: List[Dict[str, Any]], resource_name: str = "Ressource") -> None:
+    """
+    Valide l'intégrité, l'unicité stricte des clés techniques et les règles métier selon les types.
+    Lève un ValueError explicite en cas d'incohérence.
+    """
+    if not fields:
+        raise ValueError(f"Le schéma de la ressource « {resource_name} » ne contient aucun champ valide.")
+
+    seen_names = set()
+    for idx, f in enumerate(fields, start=1):
+        name = f.get("name")
+        label = f.get("label") or name
+        ftype = f.get("type") or "text"
+
+        if not name:
+            raise ValueError(f"Champ #{idx} dans « {resource_name} » : la clé technique (name) est obligatoire.")
+
+        # Règle d'unicité absolue de la clé technique au sein de la ressource
+        if name in seen_names:
+            raise ValueError(
+                f"Doublon critique dans « {resource_name} » : la clé technique « {name} » (champ « {label} ») "
+                f"est définie plusieurs fois. Chaque clé technique doit être strictement unique au sein de la ressource."
+            )
+        seen_names.add(name)
+
+        # Vérification du type
+        if ftype not in ALL_RESOURCE_TYPES:
+            raise ValueError(
+                f"Champ « {name} » dans « {resource_name} » : le type de données « {ftype} » n'est pas autorisé. "
+                f"Types valides : {', '.join(ALL_RESOURCE_TYPES[:8])}..."
+            )
+
+        # Règle spécifique pour select / multiselect : options obligatoires
+        if ftype in ["select", "multiselect"]:
+            options = f.get("options")
+            if not options or not isinstance(options, list) or len(options) == 0:
+                raise ValueError(
+                    f"Champ « {name} » (type {ftype}) dans « {resource_name} » : vous devez renseigner au moins "
+                    f"une option dans la liste des choix possibles."
+                )
+
+        # Règle spécifique pour relation : ressource cible obligatoire
+        if ftype == "relation":
+            target = f.get("target_resource_code") or f.get("target_resource_id")
+            if not target:
+                raise ValueError(
+                    f"Champ « {name} » (type relation) dans « {resource_name} » : vous devez obligatoirement "
+                    f"spécifier la ressource cible liée (colonne 'Ressource Cible')."
+                )
+
+        # Règle numérique : validation de la valeur par défaut si présente
+        if ftype in ["integer", "number", "decimal", "currency", "percentage"]:
+            def_val = f.get("default_value")
+            if def_val is not None and str(def_val).strip() != "":
+                try:
+                    float(str(def_val).replace(",", "."))
+                except (ValueError, TypeError):
+                    raise ValueError(
+                        f"Champ « {name} » (type {ftype}) dans « {resource_name} » : la valeur par défaut "
+                        f"« {def_val} » n'est pas un nombre valide."
+                    )
+
+
+def parse_single_sheet_rows(rows: List[Tuple[Any, ...]], sheet_name: str) -> List[Dict[str, Any]]:
+    """Parse les lignes d'une feuille Excel spécifique et extrait ses champs."""
+    if not rows:
+        return []
+
+    headers = [str(h or "").strip().lower() for h in rows[0]]
+
+    def find_col_idx(aliases: List[str]) -> Optional[int]:
+        for alias in aliases:
+            for idx, h in enumerate(headers):
+                if alias in h:
+                    return idx
+        return None
+
+    idx_name = find_col_idx(["name", "code", "cle", "clé", "champ", "technique"])
+    idx_label = find_col_idx(["label", "libelle", "libellé", "titre", "nom"])
+    idx_type = find_col_idx(["type", "format", "genre"])
+    idx_required = find_col_idx(["required", "obligatoire", "requis", "oblig"])
+    idx_unique = find_col_idx(["unique", "unicite", "unicité", "anti-doublon", "doublon"])
+    idx_default = find_col_idx(["default", "defaut", "défaut", "valeur_defaut"])
+    idx_options = find_col_idx(["option", "choix", "valeurs"])
+    idx_target = find_col_idx(["cible", "target", "relation", "ressource_liee", "ressource liée"])
+    idx_display = find_col_idx(["affiche", "affiché", "display", "colonne_affichage", "champ_affiche"])
+
+    fields: List[Dict[str, Any]] = []
+
+    for row in rows[1:]:
+        if not row or all(v is None or str(v).strip() == "" for v in row):
+            continue
+
+        raw_name = str(row[idx_name] or "") if idx_name is not None and idx_name < len(row) else ""
+        raw_label = str(row[idx_label] or "") if idx_label is not None and idx_label < len(row) else ""
+
+        name = normalize_field_name(raw_name or raw_label)
+        if not name:
+            continue
+
+        label = raw_label.strip() or name.replace("_", " ").title()
+        raw_type = str(row[idx_type] or "") if idx_type is not None and idx_type < len(row) else "text"
+        ftype = normalize_field_type(raw_type)
+
+        req = parse_boolean(row[idx_required]) if idx_required is not None and idx_required < len(row) else False
+        uniq = parse_boolean(row[idx_unique]) if idx_unique is not None and idx_unique < len(row) else False
+        def_val = row[idx_default] if idx_default is not None and idx_default < len(row) else None
+
+        opts = None
+        if idx_options is not None and idx_options < len(row) and row[idx_options]:
+            opts = [o.strip() for o in str(row[idx_options]).split(",") if o.strip()]
+
+        target_res = str(row[idx_target]).strip() if idx_target is not None and idx_target < len(row) and row[idx_target] else None
+        display_col = str(row[idx_display]).strip() if idx_display is not None and idx_display < len(row) and row[idx_display] else None
+
+        fields.append({
+            "name": name,
+            "label": label,
+            "type": ftype,
+            "required": req,
+            "unique": uniq,
+            "options": opts if ftype in ["select", "multiselect"] else None,
+            "default_value": def_val,
+            "target_resource_code": target_res,
+            "relation_type": "many_to_one" if ftype == "relation" else None,
+            "display_field": display_col or ("nom_complet" if target_res else None),
+        })
+
+    validate_fields_integrity(fields, resource_name=sheet_name)
+    return fields
+
+
+def parse_workbook_sheets(file_bytes: bytes) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Parse toutes les feuilles de données d'un classeur Excel (ignore les feuilles d'instructions).
+    Retourne un dictionnaire {nom_ressource_ou_feuille: liste_champs}.
+    """
+    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+    all_sheets: Dict[str, List[Dict[str, Any]]] = {}
+
+    data_sheet_names = []
+    for s_name in wb.sheetnames:
+        clean_name = s_name.strip().lower()
+        if any(kw in clean_name for kw in DOC_SHEET_KEYWORDS):
+            continue
+        data_sheet_names.append(s_name)
+
+    # Si aucune feuille de données identifiée, on prend la feuille active
+    if not data_sheet_names and wb.sheetnames:
+        data_sheet_names = [wb.active.title]
+
+    for s_name in data_sheet_names:
+        sheet = wb[s_name]
+        rows = list(sheet.iter_rows(values_only=True))
+        if not rows:
+            continue
+        parsed_fields = parse_single_sheet_rows(rows, sheet_name=s_name)
+        if parsed_fields:
+            normalized_key = normalize_field_name(s_name) or s_name.strip().lower()
+            all_sheets[normalized_key] = parsed_fields
+
+    return all_sheets
+
+
+def compute_resource_creation_order(
+    sheets_dict: Dict[str, List[Dict[str, Any]]],
+    existing_db_codes: Optional[List[str]] = None,
+) -> Tuple[List[str], Dict[str, List[str]]]:
+    """
+    Calcule l'ordre topologique de création des ressources selon les dépendances de type 'relation'.
+    Garantit que la ressource maîtresse (ex: Planteurs) est créée AVANT la ressource dépendante (ex: Plantations).
+    Vérifie qu'aucune dépendance circulaire n'existe.
+    """
+    existing_codes = set((existing_db_codes or []))
+    available_in_file = set(sheets_dict.keys())
+    
+    # dependencies: ressource -> list of resources it depends on
+    dependencies: Dict[str, List[str]] = {k: [] for k in sheets_dict.keys()}
+
+    for sheet_name, fields in sheets_dict.items():
+        for f in fields:
+            if f.get("type") == "relation":
+                target = normalize_field_name(f.get("target_resource_code") or "")
+                if not target:
+                    continue
+                # Vérifier si la cible existe dans le fichier ou en BDD
+                if target not in available_in_file and target not in existing_codes:
+                    # Permettre aussi correspondance sans préfixe
+                    target_match = any(target in s for s in available_in_file) or any(target in c.lower() for c in existing_codes)
+                    if not target_match:
+                        raise ValueError(
+                            f"Incohérence de liaison dans la ressource « {sheet_name} » : "
+                            f"Le champ « {f.get('name')} » référence la ressource cible « {target} », "
+                            f"mais celle-ci n'existe ni dans le classeur Excel ni parmi les ressources existantes."
+                        )
+                
+                if target in available_in_file and target != sheet_name:
+                    if target not in dependencies[sheet_name]:
+                        dependencies[sheet_name].append(target)
+
+    # Tri topologique (Kahn's algorithm)
+    in_degree = {k: len(deps) for k, deps in dependencies.items()}
+    queue = [k for k, deg in in_degree.items() if deg == 0]
+    ordered: List[str] = []
+
+    while queue:
+        curr = queue.pop(0)
+        ordered.append(curr)
+
+        for other, deps in dependencies.items():
+            if curr in deps:
+                in_degree[other] -= 1
+                if in_degree[other] == 0:
+                    queue.append(other)
+
+    if len(ordered) < len(sheets_dict):
+        cyclic = [k for k, deg in in_degree.items() if deg > 0]
+        raise ValueError(
+            f"Dépendance circulaire détectée entre les ressources du fichier : {', '.join(cyclic)}. "
+            f"Deux ressources ne peuvent pas dépendre mutuellement l'une de l'autre lors de la création initiale."
+        )
+
+    return ordered, dependencies
+
+
 def parse_schema_from_bytes(file_bytes: bytes, filename: str) -> List[Dict[str, Any]]:
     """
     Parse un fichier Excel (.xlsx, .xls), CSV (.csv) ou JSON (.json)
-    et extrait une liste de définitions de champs normalisées.
+    et extrait une liste de définitions de champs normalisées et strictement vérifiées.
     """
     fname = filename.lower()
     fields: List[Dict[str, Any]] = []
@@ -144,7 +388,7 @@ def parse_schema_from_bytes(file_bytes: bytes, filename: str) -> List[Dict[str, 
             raw_list = data.get("schema_fields") or data.get("fields") or data.get("items") or []
         
         if not isinstance(raw_list, list):
-            raise ValueError("Le fichier JSON doit contenir une liste de champs.")
+            raise ValueError("Le fichier JSON doit contenir une liste de champs sous 'schema_fields' ou 'fields'.")
 
         for item in raw_list:
             if not isinstance(item, dict):
@@ -173,72 +417,22 @@ def parse_schema_from_bytes(file_bytes: bytes, filename: str) -> List[Dict[str, 
                 "display_field": item.get("display_field"),
             })
 
+        validate_fields_integrity(fields, resource_name=filename)
+
     elif fname.endswith(".xlsx") or fname.endswith(".xls"):
-        wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
-        sheet = wb.active
-        rows = list(sheet.iter_rows(values_only=True))
-        if not rows:
-            return []
+        # Parsing multi-feuilles avec détection d'ordre et validation de cohérence
+        sheets = parse_workbook_sheets(file_bytes)
+        if not sheets:
+            raise ValueError("Le classeur Excel ne contient aucune feuille de données exploitable.")
 
-        # En-têtes (ligne 1)
-        headers = [str(h or "").strip().lower() for h in rows[0]]
-        
-        # Détection des index de colonnes
-        def find_col_idx(aliases: List[str]) -> Optional[int]:
-            for alias in aliases:
-                for idx, h in enumerate(headers):
-                    if alias in h:
-                        return idx
-            return None
+        # Si le fichier a plusieurs feuilles interdépendantes, calculer l'ordre et valider
+        ordered_keys, _ = compute_resource_creation_order(sheets)
 
-        idx_name = find_col_idx(["name", "code", "cle", "champ", "technique"])
-        idx_label = find_col_idx(["label", "libelle", "titre", "nom"])
-        idx_type = find_col_idx(["type", "format", "genre"])
-        idx_required = find_col_idx(["required", "obligatoire", "requis", "oblig"])
-        idx_unique = find_col_idx(["unique", "unicite", "anti-doublon", "doublon"])
-        idx_default = find_col_idx(["default", "defaut", "valeur_defaut"])
-        idx_options = find_col_idx(["option", "choix", "valeurs"])
-        idx_target = find_col_idx(["cible", "target", "relation", "ressource_liee"])
-
-        for row in rows[1:]:
-            if not row:
-                continue
-            raw_name = str(row[idx_name] or "") if idx_name is not None and idx_name < len(row) else ""
-            raw_label = str(row[idx_label] or "") if idx_label is not None and idx_label < len(row) else ""
-            
-            name = normalize_field_name(raw_name or raw_label)
-            if not name:
-                continue
-
-            label = raw_label.strip() or name.replace("_", " ").title()
-            raw_type = str(row[idx_type] or "") if idx_type is not None and idx_type < len(row) else "text"
-            ftype = normalize_field_type(raw_type)
-
-            req = parse_boolean(row[idx_required]) if idx_required is not None and idx_required < len(row) else False
-            uniq = parse_boolean(row[idx_unique]) if idx_unique is not None and idx_unique < len(row) else False
-            def_val = row[idx_default] if idx_default is not None and idx_default < len(row) else None
-            
-            opts = None
-            if idx_options is not None and idx_options < len(row) and row[idx_options]:
-                opts = [o.strip() for o in str(row[idx_options]).split(",") if o.strip()]
-
-            target_res = str(row[idx_target]).strip() if idx_target is not None and idx_target < len(row) and row[idx_target] else None
-
-            fields.append({
-                "name": name,
-                "label": label,
-                "type": ftype,
-                "required": req,
-                "unique": uniq,
-                "options": opts if ftype in ["select", "multiselect"] else None,
-                "default_value": def_val,
-                "target_resource_code": target_res,
-                "relation_type": "many_to_one" if ftype == "relation" else None,
-                "display_field": None,
-            })
+        # Si l'utilisateur importe pour une ressource spécifique, on prend la feuille prioritaire (ou 1ère feuille ordonnée)
+        primary_key = ordered_keys[0] if ordered_keys else list(sheets.keys())[0]
+        fields = sheets[primary_key]
 
     elif fname.endswith(".csv"):
-        # Détection automatique de l'encodage et délimiteur
         for encoding in ["utf-8-sig", "utf-8", "latin-1"]:
             try:
                 decoded = file_bytes.decode(encoding)
@@ -248,24 +442,24 @@ def parse_schema_from_bytes(file_bytes: bytes, filename: str) -> List[Dict[str, 
         else:
             decoded = file_bytes.decode("utf-8", errors="ignore")
 
-        # Délimiteur : virgule ou point-virgule
         first_line = decoded.splitlines()[0] if decoded.splitlines() else ""
         delim = ";" if ";" in first_line else ","
 
         reader = csv.DictReader(decoded.splitlines(), delimiter=delim)
         for row in reader:
-            # Nettoyer les clés du dict
             cleaned_row = {k.strip().lower(): v for k, v in row.items() if k}
             raw_name = (
                 cleaned_row.get("name")
                 or cleaned_row.get("code")
                 or cleaned_row.get("cle")
+                or cleaned_row.get("clé")
                 or cleaned_row.get("cle technique")
                 or ""
             )
             raw_label = (
                 cleaned_row.get("label")
                 or cleaned_row.get("libelle")
+                or cleaned_row.get("libellé")
                 or cleaned_row.get("nom")
                 or raw_name
             )
@@ -276,8 +470,8 @@ def parse_schema_from_bytes(file_bytes: bytes, filename: str) -> List[Dict[str, 
 
             ftype = normalize_field_type(cleaned_row.get("type") or "text")
             req = parse_boolean(cleaned_row.get("required") or cleaned_row.get("obligatoire"))
-            uniq = parse_boolean(cleaned_row.get("unique") or cleaned_row.get("unicite"))
-            def_val = cleaned_row.get("default_value") or cleaned_row.get("defaut")
+            uniq = parse_boolean(cleaned_row.get("unique") or cleaned_row.get("unicite") or cleaned_row.get("unicité"))
+            def_val = cleaned_row.get("default_value") or cleaned_row.get("defaut") or cleaned_row.get("défaut")
             raw_opts = cleaned_row.get("options") or cleaned_row.get("choix")
             opts = [o.strip() for o in raw_opts.split(",") if o.strip()] if raw_opts else None
 
@@ -289,10 +483,12 @@ def parse_schema_from_bytes(file_bytes: bytes, filename: str) -> List[Dict[str, 
                 "unique": uniq,
                 "options": opts,
                 "default_value": def_val,
-                "target_resource_code": cleaned_row.get("target_resource") or cleaned_row.get("cible"),
+                "target_resource_code": cleaned_row.get("target_resource") or cleaned_row.get("cible") or cleaned_row.get("ressource_liee"),
                 "relation_type": "many_to_one",
-                "display_field": None,
+                "display_field": cleaned_row.get("display_field") or cleaned_row.get("champ_affiche"),
             })
+
+        validate_fields_integrity(fields, resource_name=filename)
 
     else:
         raise ValueError("Format de fichier non supporté. Veuillez importer un fichier .xlsx, .csv ou .json.")
@@ -301,26 +497,33 @@ def parse_schema_from_bytes(file_bytes: bytes, filename: str) -> List[Dict[str, 
 
 
 def generate_schema_excel_template() -> bytes:
-    """Génère un classeur Excel modèle prêt à l'emploi avec explications et exemples concrets."""
+    """
+    Génère un classeur Excel modèle officiel multi-feuilles :
+    - Feuille 1 : 📘 Guide & Règles (Pédagogique, contraintes strictes, gestion des relations et dépendances)
+    - Feuille 2 : Planteurs (Exemple de ressource racine maîtresse)
+    - Feuille 3 : Plantations (Exemple de ressource liée à Planteurs avec dépendance et ordre de création)
+    - Feuille 4 : Types Autorisés (Guide exhaustif des 26 types avec descriptions et exemples)
+    """
     wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Gabarit Schéma Ressource"
 
-    # En-têtes
-    headers = [
-        "Clé Technique (name) *",
-        "Libellé Affiché (label) *",
-        "Type de Données (type) *",
-        "Obligatoire (required)",
-        "Valeur Unique (unique)",
-        "Valeur par Défaut (default_value)",
-        "Options (pour select/multiselect)",
-        "Ressource Cible (pour relation)",
-    ]
+    # Styles réutilisables
+    font_title = Font(name="Calibri", size=15, bold=True, color="1E293B")
+    font_subtitle = Font(name="Calibri", size=10, italic=True, color="64748B")
+    font_sec = Font(name="Calibri", size=11, bold=True, color="0F172A")
+    font_text = Font(name="Calibri", size=10, color="334155")
+    font_bold = Font(name="Calibri", size=10, bold=True, color="1E293B")
+    font_code = Font(name="Consolas", size=9, bold=True, color="047857")
 
     header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
-    header_fill = PatternFill(start_color="10B981", end_color="10B981", fill_type="solid")
-    center_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    fill_header_green = PatternFill(start_color="059669", end_color="059669", fill_type="solid")
+    fill_header_blue = PatternFill(start_color="2563EB", end_color="2563EB", fill_type="solid")
+    fill_header_purple = PatternFill(start_color="7C3AED", end_color="7C3AED", fill_type="solid")
+    fill_subtle_gray = PatternFill(start_color="F8FAFC", end_color="F8FAFC", fill_type="solid")
+
+    align_center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    align_left = Alignment(horizontal="left", vertical="center")
+    align_top_left = Alignment(horizontal="left", vertical="top", wrap_text=True)
+
     thin_border = Border(
         left=Side(style="thin", color="E2E8F0"),
         right=Side(style="thin", color="E2E8F0"),
@@ -328,101 +531,275 @@ def generate_schema_excel_template() -> bytes:
         bottom=Side(style="thin", color="E2E8F0"),
     )
 
-    ws.append(headers)
-    ws.row_dimensions[1].height = 28
+    # =========================================================================
+    # FEUILLE 1 : GUIDE & RÈGLES DE CONCEPTION
+    # =========================================================================
+    ws_guide = wb.active
+    ws_guide.title = "📘 Guide & Règles"
+    ws_guide.views.sheetView[0].showGridLines = True
 
-    for col_idx in range(1, len(headers) + 1):
-        cell = ws.cell(row=1, column=col_idx)
-        cell.font = header_font
-        cell.fill = header_fill
-        cell.alignment = center_align
-
-    # Lignes d'exemples réalistes couvrant différents types
-    sample_rows = [
-        ["matricule", "Matricule Planteur", "text", "OUI", "OUI", "", "", ""],
-        ["nom_complet", "Nom et Prénoms", "text", "OUI", "NON", "", "", ""],
-        ["superficie_ha", "Superficie (Hectares)", "decimal", "OUI", "NON", "0.0", "", ""],
-        ["date_adhesion", "Date d'Adhésion", "date", "NON", "NON", "", "", ""],
-        ["statut_certification", "Statut Certification", "select", "NON", "NON", "En cours", "En cours, Certifié Fairtrade, Certifié Bio, Non certifié", ""],
-        ["est_actif", "Compte Actif", "boolean", "OUI", "NON", "VRAI", "", ""],
-        ["contact_phone", "Numéro de Téléphone", "phone", "NON", "OUI", "", "", ""],
-        ["photo_planteur", "Photo d'Identité", "image", "NON", "NON", "", "", ""],
-        ["enregistrement_audio", "Accord Vocal Audio", "audio", "NON", "NON", "", "", ""],
-        ["video_inspection", "Vidéo d'Inspection", "video", "NON", "NON", "", "", ""],
-        ["coordonnees_gps", "Position GPS Ferme", "geo_point", "NON", "NON", "", "", ""],
-        ["contour_parcelle", "Contour Polygone GPS", "geo_polygon", "NON", "NON", "", "", ""],
-        ["qrcode_parcelle", "Code QR / Traçabilité", "barcode", "NON", "OUI", "", "", ""],
-        ["cooperative_id", "Coopérative Rattachement", "relation", "NON", "NON", "", "", "cooperatives"],
+    guide_lines = [
+        ("GUIDE ET RÈGLES DE DÉFINITION D'UN SCHÉMA DE RESSOURCE SENWISETOOL", font_title),
+        ("Ce document détaille les règles impératives à respecter lors de la création ou l'import de ressources de données.", font_subtitle),
+        ("", font_text),
+        ("1. RÈGLE D'UNICITÉ STRICTE DES CLÉS TECHNIQUES (name) :", font_sec),
+        ("• Chaque colonne d'une ressource doit posséder une « Clé Technique » unique en minuscules (ex: nom_complet, contact_phone).", font_text),
+        ("• Deux champs ne peuvent en aucun cas partager la même clé technique au sein d'une même ressource.", font_text),
+        ("• Les clés techniques sont immuables : elles servent d'identifiants informatiques pour les formulaires, exports et requêtes.", font_text),
+        ("", font_text),
+        ("2. GESTION DES RELATIONS ET DÉPENDANCES INTER-RESSOURCES (type = 'relation') :", font_sec),
+        ("• Si un champ est de type 'relation', il fait référence à une autre ressource existante ou définie dans le même classeur.", font_text),
+        ("• Colonne « Ressource Cible » : Indiquez le code ou le nom de la feuille cible (ex: 'planteurs').", font_text),
+        ("• Colonne « Champ Affiché Cible » : Indiquez le champ utilisé pour afficher la relation (ex: 'nom_complet' ou 'matricule').", font_text),
+        ("• ORDRE DE CRÉATION AUTOMATIQUE : Si votre fichier contient plusieurs feuilles interdépendantes :", font_bold),
+        ("    - La feuille racine maîtresse (ex: 'Planteurs') doit être créée d'abord.", font_text),
+        ("    - La feuille dépendante (ex: 'Plantations') est créée ensuite car elle a besoin de relier chaque plantation à son planteur.", font_text),
+        ("    - Notre moteur SenWiseTool détecte automatiquement cette arborescence et ordonne la création sans erreur.", font_text),
+        ("", font_text),
+        ("3. RÈGLES PAR TYPE DE DONNÉES :", font_sec),
+        ("• Listes déroulantes (select & multiselect) : La colonne « Options » est OBLIGATOIRE, séparée par des virgules (ex: A, B, C).", font_text),
+        ("• Numériques (integer, decimal, currency, percentage) : La valeur par défaut éventuelle doit être un nombre valide.", font_text),
+        ("• Booléens (boolean) : Utilisez 'VRAI' ou 'FAUX' (ou 'OUI'/'NON').", font_text),
+        ("• Géolocalisation (geo_point, geo_polygon) : Pour coordonnées GPS ou polygones de parcelles agricoles.", font_text),
+        ("• Traçabilité (barcode) : Pour codes QR et codes-barres de lots ou de sacs.", font_text),
+        ("", font_text),
+        ("Consultez la feuille « Types Autorisés » pour la documentation exhaustive des 26 types supportés.", font_bold),
     ]
 
-    for row_data in sample_rows:
-        ws.append(row_data)
+    for r_idx, (text, fnt) in enumerate(guide_lines, start=1):
+        ws_guide.cell(row=r_idx, column=1, value=text).font = fnt
+        ws_guide.row_dimensions[r_idx].height = 22 if fnt in [font_title, font_sec] else 18
 
-    # Style des lignes de données
-    for r_idx in range(2, len(sample_rows) + 2):
-        ws.row_dimensions[r_idx].height = 20
-        for c_idx in range(1, len(headers) + 1):
-            cell = ws.cell(row=r_idx, column=c_idx)
+    ws_guide.column_dimensions["A"].width = 110
+
+    # Colonnes standards pour les feuilles de données
+    headers_data = [
+        "Clé Technique (name) *",
+        "Libellé Affiché (label) *",
+        "Type de Données (type) *",
+        "Obligatoire (required)",
+        "Valeur Unique (unique)",
+        "Valeur par Défaut (default_value)",
+        "Options (pour select / multiselect)",
+        "Ressource Cible (pour relation)",
+        "Champ Affiché Cible (display_field)",
+    ]
+
+    def apply_data_sheet_styling(ws, header_fill):
+        ws.append(headers_data)
+        ws.row_dimensions[1].height = 28
+        for col_idx in range(1, len(headers_data) + 1):
+            cell = ws.cell(row=1, column=col_idx)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = align_center
+
+        widths = [26, 28, 22, 18, 18, 26, 45, 26, 26]
+        for idx, w in enumerate(widths, start=1):
+            ws.column_dimensions[get_column_letter(idx)].width = w
+
+    # =========================================================================
+    # FEUILLE 2 : EXEMPLE 1 - PLANTEURS (Ressource Racine Maîtresse)
+    # =========================================================================
+    ws_planteurs = wb.create_sheet(title="Planteurs")
+    apply_data_sheet_styling(ws_planteurs, fill_header_green)
+
+    planteurs_rows = [
+        ["matricule", "Matricule Planteur", "text", "OUI", "OUI", "", "", "", ""],
+        ["nom_complet", "Nom et Prénoms", "text", "OUI", "NON", "", "", "", ""],
+        ["contact_phone", "Numéro de Téléphone", "phone", "OUI", "OUI", "", "", "", ""],
+        ["date_adhesion", "Date d'Adhésion Coopérative", "date", "OUI", "NON", "", "", "", ""],
+        ["statut_certification", "Statut Certification", "select", "NON", "NON", "En cours", "En cours, Certifié Fairtrade, Certifié Rainforest, Non certifié", "", ""],
+        ["photo_identite", "Photo d'Identité", "image", "NON", "NON", "", "", "", ""],
+        ["est_actif", "Compte Actif", "boolean", "OUI", "NON", "VRAI", "", "", ""],
+    ]
+
+    for r_data in planteurs_rows:
+        ws_planteurs.append(r_data)
+
+    for r_idx in range(2, len(planteurs_rows) + 2):
+        ws_planteurs.row_dimensions[r_idx].height = 20
+        for c_idx in range(1, len(headers_data) + 1):
+            cell = ws_planteurs.cell(row=r_idx, column=c_idx)
             cell.border = thin_border
             if c_idx in [3, 4, 5]:
-                cell.alignment = Alignment(horizontal="center", vertical="center")
+                cell.alignment = align_center
+            elif c_idx == 1:
+                cell.font = font_code
+                cell.alignment = align_left
             else:
-                cell.alignment = Alignment(vertical="center")
+                cell.alignment = align_left
 
-    # Ajustement automatique des largeurs de colonnes
-    col_widths = [26, 28, 22, 18, 18, 26, 45, 26]
-    for idx, width in enumerate(col_widths, start=1):
-        col_letter = get_column_letter(idx)
-        ws.column_dimensions[col_letter].width = width
+    # =========================================================================
+    # FEUILLE 3 : EXEMPLE 2 - PLANTATIONS (Ressource Liée à Planteurs)
+    # =========================================================================
+    ws_plantations = wb.create_sheet(title="Plantations")
+    apply_data_sheet_styling(ws_plantations, fill_header_blue)
 
-    # Feuille 2 : Documentation des types acceptés
+    plantations_rows = [
+        ["code_plantation", "Code de la Parcelle", "text", "OUI", "OUI", "", "", "", ""],
+        ["nom_parcelle", "Désignation de la Parcelle", "text", "OUI", "NON", "", "", "", ""],
+        ["planteur_referent", "Planteur Référent", "relation", "OUI", "NON", "", "", "planteurs", "nom_complet"],
+        ["superficie_ha", "Superficie Estimée (ha)", "decimal", "OUI", "NON", "0.0", "", "", ""],
+        ["annee_creation", "Année de Création", "integer", "NON", "NON", "", "", "", ""],
+        ["cultures_associees", "Cultures Associées", "multiselect", "NON", "NON", "Cacao", "Cacao, Café, Hévéa, Banane, Palmier à huile", "", ""],
+        ["coordonnees_gps", "Position GPS du Centre", "geo_point", "NON", "NON", "", "", "", ""],
+        ["contour_parcelle", "Tracé Polygone Délimitation", "geo_polygon", "NON", "NON", "", "", "", ""],
+        ["qrcode_tracabilite", "Code QR de Traçabilité", "barcode", "NON", "OUI", "", "", "", ""],
+    ]
+
+    for r_data in plantations_rows:
+        ws_plantations.append(r_data)
+
+    for r_idx in range(2, len(plantations_rows) + 2):
+        ws_plantations.row_dimensions[r_idx].height = 20
+        for c_idx in range(1, len(headers_data) + 1):
+            cell = ws_plantations.cell(row=r_idx, column=c_idx)
+            cell.border = thin_border
+            if c_idx in [3, 4, 5]:
+                cell.alignment = align_center
+            elif c_idx == 1:
+                cell.font = font_code
+                cell.alignment = align_left
+            elif c_idx == 3 and cell.value == "relation":
+                cell.font = Font(name="Calibri", size=10, bold=True, color="2563EB")
+                cell.alignment = align_center
+            else:
+                cell.alignment = align_left
+
+    # =========================================================================
+    # FEUILLE 4 : TYPES AUTORISÉS (Documentation exhaustive des 26 types)
+    # =========================================================================
     ws_doc = wb.create_sheet(title="Types Autorisés")
-    doc_headers = ["Type Technique", "Description Métier", "Exemples d'Usage"]
+    doc_headers = ["Type Technique *", "Catégorie", "Description Métier", "Exemples Concrets d'Usage"]
     ws_doc.append(doc_headers)
     ws_doc.row_dimensions[1].height = 26
-    for c in range(1, 4):
-        ws_doc.cell(row=1, column=c).font = header_font
-        ws_doc.cell(row=1, column=c).fill = PatternFill(start_color="3B82F6", end_color="3B82F6", fill_type="solid")
+    for c in range(1, 5):
+        cell = ws_doc.cell(row=1, column=c)
+        cell.font = header_font
+        cell.fill = fill_header_purple
+        cell.alignment = align_center
 
     type_doc = [
-        ["text", "Texte court simple", "Nom, code matricule, référence"],
-        ["textarea", "Texte multi-lignes", "Observations, description, commentaires"],
-        ["number", "Nombre générique", "Quantité, capacité"],
-        ["integer", "Entier strict", "Nombre d'enfants, sacs, arbres"],
-        ["decimal", "Nombre décimal à virgule", "Superficie en ha, poids en kg, rendement"],
-        ["boolean", "Booléen Oui/Non", "Certifié, Actif, Validé"],
-        ["currency", "Montant financier avec devise", "Prix d'achat, avance, prime"],
-        ["percentage", "Pourcentage", "Taux d'humidité, pureté"],
-        ["date", "Date au format AAAA-MM-JJ", "Date de naissance, date de récolte"],
-        ["datetime", "Date et heure complète", "Horodatage de pesée"],
-        ["time", "Heure au format HH:MM", "Heure d'ouverture, tournée"],
-        ["email", "Adresse électronique", "contact@coop.ci"],
-        ["phone", "Téléphone", "+225 0700000000"],
-        ["url", "Lien Internet", "Fiche technique web"],
-        ["select", "Choix unique parmi une liste", "Statut, grade de cacao (I, II)"],
-        ["multiselect", "Choix multiples", "Cultures associées (Café, Cacao, Hévéa)"],
-        ["file", "Document joint", "Contrat PDF, reçu"],
-        ["image", "Photo", "Photo du planteur, état du champ"],
-        ["audio", "Fichier audio / Enregistrement vocal", "Accord verbal, interview"],
-        ["video", "Fichier vidéo / Enregistrement visuel", "Inspection visuelle par drone"],
-        ["geo_point", "Coordonnées GPS (Lat, Long)", "Localisation exacte du magasin"],
-        ["geo_polygon", "Contour géographique parcelle", "Polygone GeoJSON de la parcelle"],
-        ["barcode", "Code-barres / QR Code", "QR code sur le sac de cacao"],
-        ["color", "Code couleur HEX", "Code visuel catégorie (#10B981)"],
-        ["json", "Objet structuré JSON libre", "Paramètres bruts IoT"],
-        ["relation", "Liaison vers une autre ressource", "Lien Planteur -> Coopérative"],
+        ["text", "Basique", "Texte court sur ligne unique", "Nom, prénom, matricule, référence"],
+        ["textarea", "Basique", "Texte long multi-lignes", "Observations d'audit, descriptions, notes"],
+        ["number", "Numérique", "Nombre générique (entier ou décimal)", "Quantité récoltée, score global"],
+        ["integer", "Numérique", "Nombre entier strict sans virgule", "Nombre d'arbres, sacs de cacao, ouvriers"],
+        ["decimal", "Numérique", "Nombre décimal avec précision à virgule", "Superficie en hectares, poids en kg"],
+        ["boolean", "Basique", "Booléen Vrai/Faux (Case à cocher)", "Compte actif, Parcelle certifiée EUDR"],
+        ["currency", "Numérique & Finance", "Montant financier avec devise", "Prix unitaire, prime Fairtrade, avance"],
+        ["percentage", "Numérique & Finance", "Valeur en pourcentage (0 à 100%)", "Taux d'humidité du cacao, taux de pureté"],
+        ["date", "Date & Heure", "Date au format AAAA-MM-JJ", "Date de naissance, date d'inspection"],
+        ["datetime", "Date & Heure", "Date et heure complètes avec horodatage", "Horodatage de la pesée en magasin"],
+        ["time", "Date & Heure", "Heure au format HH:MM", "Heure d'ouverture, heure de rotation"],
+        ["email", "Contact", "Adresse électronique vérifiée", "contact@cooperative.ci"],
+        ["phone", "Contact", "Numéro de téléphone avec indicatif", "+225 0708091011"],
+        ["url", "Web", "Lien Internet / URL valide", "https://agriculture.gouv.ci/cadastre/124"],
+        ["select", "Choix", "Liste déroulante (un seul choix)", "Statut, Grade cacao (Grade I, Grade II)"],
+        ["multiselect", "Choix", "Choix multiples (Étiquettes / Tags)", "Cultures associées (Cacao, Café, Hévéa)"],
+        ["file", "Médias", "Document ou fichier joint (PDF, Doc)", "Contrat de fermage, titre foncier numérisé"],
+        ["image", "Médias", "Photographie ou image (JPG, PNG)", "Photo du planteur, photo du plant infecté"],
+        ["audio", "Médias", "Enregistrement audio / vocal", "Accord verbal enregistré, note vocale agent"],
+        ["video", "Médias", "Enregistrement vidéo (MP4, WebM)", "Survol drone de la plantation, audit visuel"],
+        ["geo_point", "Géographie", "Coordonnées GPS précises (Lat, Long)", "Localisation exacte du hangar de stockage"],
+        ["geo_polygon", "Géographie", "Contour géographique d'une parcelle", "Polygone GeoJSON délimitant la plantation"],
+        ["barcode", "Traçabilité", "Code-barres ou QR Code scannable", "QR code apposé sur chaque sac scellé"],
+        ["color", "Avancé", "Code couleur hexadécimal (#RRGGBB)", "Code couleur d'identification de parcelle"],
+        ["json", "Avancé", "Objet structuré JSON libre", "Trames brutes de capteurs IoT, météo locale"],
+        ["relation", "Relations", "Liaison vers une autre ressource liée", "Lien Plantation -> Planteur référent"],
     ]
 
     for d in type_doc:
         ws_doc.append(d)
 
-    ws_doc.column_dimensions["A"].width = 20
-    ws_doc.column_dimensions["B"].width = 38
-    ws_doc.column_dimensions["C"].width = 45
+    for r_idx in range(2, len(type_doc) + 2):
+        ws_doc.row_dimensions[r_idx].height = 20
+        for c_idx in range(1, 5):
+            cell = ws_doc.cell(row=r_idx, column=c_idx)
+            cell.border = thin_border
+            if c_idx == 1:
+                cell.font = font_code
+                cell.alignment = align_center
+            else:
+                cell.alignment = align_left
+
+    ws_doc.column_dimensions["A"].width = 22
+    ws_doc.column_dimensions["B"].width = 22
+    ws_doc.column_dimensions["C"].width = 42
+    ws_doc.column_dimensions["D"].width = 50
 
     output = io.BytesIO()
     wb.save(output)
     return output.getvalue()
+
+
+NON_DISPLAYABLE_TYPES = {
+    "relation",
+    "json",
+    "file",
+    "signature",
+    "geo_polygon",
+    "rich_text",
+    "audio",
+}
+
+
+def generate_unique_values(
+    strategy_cfg: Dict[str, Any],
+    count: int,
+    field_name: str,
+    field_type: str,
+) -> Tuple[Optional[List[Any]], Optional[str]]:
+    """
+    Génère une séquence de valeurs uniques pour combler les enregistrements existants
+    selon la stratégie choisie (auto-incrément, code séquentiel, token unique ou tableau distinct).
+    """
+    strategy = strategy_cfg.get("strategy")
+    if not strategy:
+        return None, "Stratégie non spécifiée."
+
+    if strategy in ["auto_increment", "sequential_number"]:
+        try:
+            start = int(strategy_cfg.get("start", 1))
+            step = int(strategy_cfg.get("step", 1))
+        except (ValueError, TypeError):
+            start, step = 1, 1
+        return [start + i * step for i in range(count)], None
+
+    elif strategy in ["sequential_code", "auto_code"]:
+        prefix = str(strategy_cfg.get("prefix") or f"{field_name.upper()}-")
+        try:
+            start = int(strategy_cfg.get("start", 1))
+            pad = max(1, int(strategy_cfg.get("pad_length", 4)))
+        except (ValueError, TypeError):
+            start, pad = 1, 4
+        suffix = str(strategy_cfg.get("suffix") or "")
+        return [f"{prefix}{start + i:0{pad}d}{suffix}" for i in range(count)], None
+
+    elif strategy in ["unique_token", "uuid"]:
+        prefix = str(strategy_cfg.get("prefix") or "")
+        seen = set()
+        vals = []
+        for _ in range(count):
+            tok = secrets.token_hex(4).upper()
+            while tok in seen:
+                tok = secrets.token_hex(4).upper()
+            seen.add(tok)
+            vals.append(f"{prefix}{tok}")
+        return vals, None
+
+    elif strategy == "distinct_values":
+        raw_vals = strategy_cfg.get("values")
+        if not isinstance(raw_vals, list):
+            return None, "La stratégie 'distinct_values' requiert une liste de valeurs distinctes."
+        if len(raw_vals) < count:
+            return None, f"Le tableau fourni ne contient que {len(raw_vals)} valeur(s) pour {count} enregistrements existants."
+        distinct_slice = raw_vals[:count]
+        if len(set(distinct_slice)) < count:
+            return None, "Le tableau fourni contient des valeurs en doublon. Chaque entrée doit être strictement unique."
+        return distinct_slice, None
+
+    return None, f"Stratégie d'unicité « {strategy} » non supportée."
 
 
 def reconcile_schema_coherence(
@@ -431,74 +808,163 @@ def reconcile_schema_coherence(
     existing_items: Optional[List[Dict[str, Any]]] = None,
     current_version: str = "1.0.0",
     is_active: bool = False,
+    other_resources: Optional[List[Dict[str, Any]]] = None,
+    current_resource_id: Optional[int] = None,
+    current_resource_code: Optional[str] = None,
+    current_resource_name: Optional[str] = None,
+    unique_population_strategies: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """
-    Rapproche un schéma existant et des champs entrants (Excel/JSON)
-    en garantissant l'intégrité, l'authenticité et la cohérence absolue avec les données existantes.
+    Rapproche un schéma existant et des champs entrants (Excel/JSON/Formulaire)
+    en garantissant l'intégrité, l'authenticité et la cohérence absolue avec les données existantes
+    et avec les autres ressources dépendantes :
+    1. Vérification inter-ressources : bloque la suppression ou la modification de type incompatible
+       si une autre ressource dépend d'un champ comme cible de liaison ou champ d'affichage.
+    2. Ajout de champs obligatoires : exige une valeur par défaut si des enregistrements existent.
+    3. Gestion stricte de l'unicité : interdit l'assignation statique de valeurs identiques et applique
+       les stratégies de valorisation unique (auto-incrément, code séquentiel, tokens, tableau distinct).
     """
     items = existing_items or []
     item_count = len(items)
 
     existing_map = {f["name"]: dict(f) for f in existing_fields}
+    incoming_map = {f["name"]: dict(f) for f in incoming_fields if f.get("name")}
     incoming_seen = set()
 
     added_fields: List[Dict[str, Any]] = []
     updated_fields: List[Dict[str, Any]] = []
     identical_fields: List[str] = []
     ignored_fields: List[Dict[str, Any]] = []
+    deleted_fields: List[Dict[str, Any]] = []
+    unique_population_actions: Dict[str, Any] = {}
 
     warnings: List[str] = []
     errors: List[str] = []
 
-    resulting_map = dict(existing_map)
+    res_code_norm = normalize_field_name(current_resource_code or "")
+    res_name_norm = normalize_field_name(current_resource_name or "")
+
+    # -------------------------------------------------------------------------
+    # 1. DÉTECTION ET VÉRIFICATION DES CHAMPS SUPPRIMÉS (existing - incoming)
+    # -------------------------------------------------------------------------
+    incoming_names = set(incoming_map.keys())
+    for old_name, old_field in existing_map.items():
+        if old_name not in incoming_names:
+            del_label = old_field.get("label") or old_name
+            # Vérifier si une autre ressource dépend de ce champ
+            is_dependent = False
+            for other in (other_resources or []):
+                other_id = other.get("id")
+                other_name = other.get("name") or other.get("code") or "Autre ressource"
+                for o_field in other.get("schema_fields") or []:
+                    if o_field.get("type") == "relation":
+                        target_id = o_field.get("target_resource_id")
+                        target_code = normalize_field_name(o_field.get("target_resource_code") or "")
+                        targets_current = (
+                            (current_resource_id is not None and target_id == current_resource_id)
+                            or (target_code and res_code_norm and target_code == res_code_norm)
+                            or (target_code and res_name_norm and target_code == res_name_norm)
+                        )
+                        if targets_current:
+                            disp_f = o_field.get("display_field")
+                            tgt_f = o_field.get("target_field")
+                            rel_label = o_field.get("label") or o_field.get("name")
+                            if disp_f == old_name:
+                                is_dependent = True
+                                errors.append(
+                                    f"Impossible de supprimer le champ « {del_label} » (clé: '{old_name}') : "
+                                    f"La ressource « {other_name} » en dépend directement car son champ de liaison « {rel_label} » "
+                                    f"l'utilise comme libellé d'affichage cible."
+                                )
+                            elif tgt_f == old_name:
+                                is_dependent = True
+                                errors.append(
+                                    f"Impossible de supprimer le champ « {del_label} » (clé: '{old_name}') : "
+                                    f"La ressource « {other_name} » en dépend directement car son champ de liaison « {rel_label} » "
+                                    f"cible spécifiquement cette colonne."
+                                )
+
+            if not is_dependent:
+                deleted_fields.append(old_field)
+                if item_count > 0:
+                    warnings.append(
+                        f"Le champ « {del_label} » ({old_name}) sera supprimé et ses données seront définitivement purgées "
+                        f"des {item_count} enregistrement(s) existant(s)."
+                    )
+
+    # -------------------------------------------------------------------------
+    # 2. PARCOURS DES CHAMPS ENTRANTS (AJOUTS ET MISES À JOUR)
+    # -------------------------------------------------------------------------
+    resulting_map: Dict[str, Dict[str, Any]] = {}
 
     for incoming in incoming_fields:
         name = incoming.get("name")
         if not name:
             continue
 
+        label = incoming.get("label") or name
         if name in incoming_seen:
-            warnings.append(f"Champ en double dans le fichier importé: '{name}'. La dernière occurrence a été prise en compte.")
+            warnings.append(f"Champ en double dans le lot soumis: '{name}'. La dernière occurrence a été conservée.")
         incoming_seen.add(name)
 
-        # 1. Nouveau champ (AJOUT)
+        # ---------------------------------------------------------------------
+        # CAS A : NOUVEAU CHAMP (AJOUT)
+        # ---------------------------------------------------------------------
         if name not in existing_map:
-            # Vérification de cohérence avec les données existantes
             is_req = incoming.get("required", False)
             def_val = incoming.get("default_value")
             is_uniq = incoming.get("unique", False)
+            ftype = incoming.get("type", "text")
 
+            # Règle obligatoire avec données existantes
             if is_req and item_count > 0:
-                if def_val is None or def_val == "":
+                if def_val is None or str(def_val).strip() == "":
                     errors.append(
-                        f"Incohérence: Le nouveau champ '{incoming.get('label') or name}' est marqué 'Obligatoire', "
+                        f"Incohérence : Le nouveau champ « {label} » est marqué 'Obligatoire', "
                         f"mais la ressource contient déjà {item_count} enregistrement(s) sans valeur par défaut définie. "
-                        f"Veuillez spécifier une valeur par défaut pour combler les enregistrements existants."
+                        f"Veuillez obligatoirement spécifier une valeur par défaut pour alimenter les enregistrements existants."
                     )
                 else:
                     warnings.append(
-                        f"Le champ obligatoire '{incoming.get('label') or name}' sera injecté avec la valeur par défaut "
-                        f"'{def_val}' pour les {item_count} enregistrement(s) existant(s)."
+                        f"Le champ obligatoire « {label} » sera injecté avec la valeur par défaut « {def_val} » "
+                        f"pour les {item_count} enregistrement(s) existant(s)."
                     )
 
-            if is_uniq and item_count > 1 and (def_val is not None and def_val != ""):
-                errors.append(
-                    f"Incohérence: Le champ '{name}' est marqué 'Unique' mais a une valeur par défaut statique ('{def_val}'). "
-                    f"Cela créerait {item_count} doublons dans les données existantes."
-                )
+            # Règle unicité avec données existantes
+            if is_uniq and item_count > 1:
+                # Si valeur statique unique demandée sans stratégie
+                strat_cfg = (unique_population_strategies or {}).get(name)
+                if strat_cfg:
+                    gen_vals, err = generate_unique_values(strat_cfg, item_count, name, ftype)
+                    if err:
+                        errors.append(f"Champ unique « {label} » : {err}")
+                    else:
+                        mapping = {items[idx]["id"]: gen_vals[idx] for idx in range(item_count)}
+                        unique_population_actions[name] = mapping
+                        warnings.append(
+                            f"Le champ unique « {label} » sera initialisé avec des valeurs distinctes pour les "
+                            f"{item_count} enregistrements via la stratégie '{strat_cfg.get('strategy')}'."
+                        )
+                else:
+                    errors.append(
+                        f"Conflit d'unicité : Le champ « {label} » ({name}) ne peut pas être ajouté comme unique "
+                        f"car la ressource contient déjà {item_count} enregistrements. Une valeur statique créerait des collisions. "
+                        f"Veuillez définir une stratégie de valorisation unique (auto-incrément séquentiel, code numéroté, "
+                        f"tokens uniques ou tableau de valeurs distinctes)."
+                    )
 
             added_fields.append(incoming)
             resulting_map[name] = incoming
 
-        # 2. Champ existant (MISE À JOUR ou IDENTIQUE)
+        # ---------------------------------------------------------------------
+        # CAS B : CHAMP EXISTANT (MISE À JOUR OU INCHANGÉ)
+        # ---------------------------------------------------------------------
         else:
             old_f = existing_map[name]
-            # Comparer si quelque chose a changé
             diffs = {}
             for k in ["label", "type", "required", "unique", "options", "default_value", "target_resource_code", "display_field"]:
                 old_val = old_f.get(k)
                 new_val = incoming.get(k)
-                # Tolérance pour listes d'options
                 if isinstance(old_val, list) and isinstance(new_val, list):
                     if sorted(old_val) != sorted(new_val):
                         diffs[k] = (old_val, new_val)
@@ -507,76 +973,107 @@ def reconcile_schema_coherence(
 
             if not diffs:
                 identical_fields.append(name)
+                resulting_map[name] = old_f
             else:
-                # Vérifier si les modifications préservent la cohérence absolue des données existantes
                 is_coherent = True
 
-                # Changement de type ?
-                if "type" in diffs and item_count > 0:
+                # 1. Vérification inter-ressources sur modification de type
+                if "type" in diffs:
                     old_t, new_t = diffs["type"]
-                    # Tester si les données existantes peuvent être converties
-                    incompatible_samples = []
-                    for item in items:
-                        val = item.get("data", {}).get(name)
-                        if val is not None and val != "":
-                            if new_t in ["number", "integer", "decimal"]:
-                                try:
-                                    float(str(val).replace(",", "."))
-                                except ValueError:
-                                    incompatible_samples.append(str(val))
-                                    break
-                            elif new_t == "boolean":
-                                if str(val).lower() not in ["true", "false", "0", "1", "oui", "non"]:
-                                    incompatible_samples.append(str(val))
-                                    break
+                    if new_t in NON_DISPLAYABLE_TYPES:
+                        for other in (other_resources or []):
+                            other_name = other.get("name") or other.get("code") or "Autre ressource"
+                            for o_field in other.get("schema_fields") or []:
+                                if o_field.get("type") == "relation":
+                                    target_id = o_field.get("target_resource_id")
+                                    target_code = normalize_field_name(o_field.get("target_resource_code") or "")
+                                    targets_current = (
+                                        (current_resource_id is not None and target_id == current_resource_id)
+                                        or (target_code and res_code_norm and target_code == res_code_norm)
+                                        or (target_code and res_name_norm and target_code == res_name_norm)
+                                    )
+                                    if targets_current and o_field.get("display_field") == name:
+                                        is_coherent = False
+                                        rel_label = o_field.get("label") or o_field.get("name")
+                                        errors.append(
+                                            f"Impossible de modifier le type du champ « {label} » en « {new_t} » : "
+                                            f"La ressource « {other_name} » l'utilise comme libellé d'affichage pour sa relation « {rel_label} ». "
+                                            f"Un libellé d'affichage doit rester un format représentable (ex: text, number, date, badge)."
+                                        )
 
-                    if incompatible_samples:
-                        is_coherent = False
-                        errors.append(
-                            f"Incohérence type: Impossible de convertir le champ '{name}' de '{old_t}' vers '{new_t}'. "
-                            f"Des données existantes incompatibles ont été détectées (ex: '{incompatible_samples[0]}')."
-                        )
+                    # Vérification compatibilité avec les données existantes
+                    if item_count > 0:
+                        incompatible_samples = []
+                        for item in items:
+                            val = item.get("data", {}).get(name)
+                            if val is not None and str(val).strip() != "":
+                                if new_t in ["number", "integer", "decimal"]:
+                                    try:
+                                        float(str(val).replace(",", "."))
+                                    except ValueError:
+                                        incompatible_samples.append(str(val))
+                                        break
+                                elif new_t == "boolean":
+                                    if str(val).lower() not in ["true", "false", "0", "1", "oui", "non"]:
+                                        incompatible_samples.append(str(val))
+                                        break
 
-                # Passage à Unique = True ?
+                        if incompatible_samples:
+                            is_coherent = False
+                            errors.append(
+                                f"Incohérence type : Impossible de convertir le champ « {name} » de « {old_t} » vers « {new_t} ». "
+                                f"Des données existantes incompatibles ont été détectées (ex: « {incompatible_samples[0]} »)."
+                            )
+
+                # 2. Passage à Unique = True
                 if "unique" in diffs and diffs["unique"][1] is True and item_count > 0:
-                    seen_values = {}
-                    duplicates = []
-                    for item in items:
-                        val = item.get("data", {}).get(name)
-                        if val is not None and val != "":
-                            sval = str(val).strip().lower()
-                            if sval in seen_values:
-                                duplicates.append(str(val))
-                            seen_values[sval] = item.get("id")
+                    vals = [it.get("data", {}).get(name) for it in items]
+                    non_empty = [v for v in vals if v is not None and str(v).strip() != ""]
+                    has_duplicates = len(set(non_empty)) < len(non_empty)
+                    has_empty = len(non_empty) < item_count
 
-                    if duplicates:
-                        is_coherent = False
-                        errors.append(
-                            f"Incohérence unicité: Impossible de rendre le champ '{name}' unique car {len(duplicates)} "
-                            f"doublon(s) existe(nt) déjà dans les enregistrements existants (ex: '{duplicates[0]}')."
-                        )
+                    if has_duplicates or has_empty:
+                        strat_cfg = (unique_population_strategies or {}).get(name)
+                        if strat_cfg:
+                            gen_vals, err = generate_unique_values(strat_cfg, item_count, name, incoming.get("type", "text"))
+                            if err:
+                                is_coherent = False
+                                errors.append(f"Champ unique « {name} » : {err}")
+                            else:
+                                mapping = {items[idx]["id"]: gen_vals[idx] for idx in range(item_count)}
+                                unique_population_actions[name] = mapping
+                                warnings.append(
+                                    f"Les doublons/vides du champ « {name} » seront résolus pour les {item_count} enregistrements "
+                                    f"via la stratégie '{strat_cfg.get('strategy')}'."
+                                )
+                        else:
+                            is_coherent = False
+                            errors.append(
+                                f"Incohérence unicité : Impossible de rendre le champ « {name} » unique car des doublons ou valeurs vides "
+                                f"existent parmi les {item_count} enregistrements actuels. Veuillez fournir une stratégie de valorisation "
+                                f"unique (auto-incrément, code séquentiel, tokens uniques ou tableau de valeurs distinctes) pour régénérer des identifiants distincts."
+                            )
 
-                # Passage à Obligatoire = True ?
+                # 3. Passage à Obligatoire = True
                 if "required" in diffs and diffs["required"][1] is True and item_count > 0:
                     missing_count = sum(
                         1 for it in items
-                        if it.get("data", {}).get(name) is None or it.get("data", {}).get(name) == ""
+                        if it.get("data", {}).get(name) is None or str(it.get("data", {}).get(name)).strip() == ""
                     )
                     if missing_count > 0:
                         new_def = incoming.get("default_value")
-                        if new_def is None or new_def == "":
+                        if new_def is None or str(new_def).strip() == "":
                             is_coherent = False
                             errors.append(
-                                f"Incohérence obligation: Le champ '{name}' contient {missing_count} valeur(s) vide(s) "
-                                f"dans les données actuelles. Veuillez fournir une valeur par défaut pour combler les vides."
+                                f"Incohérence obligation : Le champ « {name} » contient {missing_count} valeur(s) vide(s) "
+                                f"dans les données actuelles. Veuillez fournir une valeur par défaut pour combler les enregistrements existants."
                             )
                         else:
                             warnings.append(
-                                f"Le champ '{name}' rendu obligatoire sera complété par '{new_def}' pour {missing_count} ligne(s) vide(s)."
+                                f"Le champ « {name} » rendu obligatoire sera complété par « {new_def} » pour {missing_count} ligne(s) vide(s)."
                             )
 
                 if is_coherent:
-                    # Mettre à jour le champ en fusionnant les propriétés
                     merged = dict(old_f)
                     merged.update(incoming)
                     updated_fields.append(merged)
@@ -586,10 +1083,15 @@ def reconcile_schema_coherence(
                         "field": incoming,
                         "reason": "Modifications rejetées pour préserver la cohérence des données existantes."
                     })
+                    # Conserver l'ancien champ
+                    resulting_map[name] = old_f
+
+    # Ordonner le schéma résultant selon l'ordre des champs entrants
+    resulting_schema = [resulting_map[inc["name"]] for inc in incoming_fields if inc.get("name") in resulting_map]
 
     # Calcul de la nouvelle version si active et modifications effectives
     new_version = current_version
-    has_changes = bool(added_fields or updated_fields)
+    has_changes = bool(added_fields or updated_fields or deleted_fields)
     if is_active and has_changes:
         try:
             parts = current_version.split(".")
@@ -601,18 +1103,19 @@ def reconcile_schema_coherence(
         except Exception:
             new_version = f"{current_version}-v2"
 
-    resulting_schema = list(resulting_map.values())
-
     return {
         "is_coherent": len(errors) == 0,
         "added_count": len(added_fields),
         "updated_count": len(updated_fields),
+        "deleted_count": len(deleted_fields),
         "identical_count": len(identical_fields),
         "ignored_count": len(ignored_fields),
         "added_fields": added_fields,
         "updated_fields": updated_fields,
+        "deleted_fields": deleted_fields,
         "identical_fields": identical_fields,
         "ignored_fields": ignored_fields,
+        "unique_population_actions": unique_population_actions,
         "warnings": warnings,
         "errors": errors,
         "resulting_schema": resulting_schema,

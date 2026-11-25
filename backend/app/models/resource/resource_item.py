@@ -17,6 +17,9 @@ class ResourceItem(Base):
     resource_id = Column(
         Integer, ForeignKey("resources.id", ondelete="CASCADE"), nullable=False, index=True
     )
+    resource_version_id = Column(
+        Integer, ForeignKey("resource_versions.id", ondelete="CASCADE"), nullable=True, index=True
+    )
     organization_id = Column(
         Integer, ForeignKey("organizations.id", ondelete="CASCADE"), nullable=True, index=True
     )
@@ -32,5 +35,6 @@ class ResourceItem(Base):
 
     # Relations
     resource = relationship("Resource", back_populates="items", lazy="joined")
+    version = relationship("ResourceVersion", foreign_keys=[resource_version_id], lazy="joined")
     organization = relationship("Organization", lazy="joined")
     created_by = relationship("User", foreign_keys=[created_by_id], lazy="selectin")

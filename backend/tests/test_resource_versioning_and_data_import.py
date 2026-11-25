@@ -1,5 +1,6 @@
 import io
 import json
+import uuid
 import pytest
 from httpx import AsyncClient
 import openpyxl
@@ -14,10 +15,11 @@ from app.models.resource.resource_item import ResourceItem
 async def test_resource_versioning_auto_increment_and_strict_data_import(async_client: AsyncClient, setup_db):
     from tests.conftest import TestingSessionLocal
 
+    uid = uuid.uuid4().hex[:6]
     async with TestingSessionLocal() as session:
         admin_user = User(
-            email="admin_versioning@swt.com",
-            username="admin_versioning",
+            email=f"admin_versioning_{uid}@swt.com",
+            username=f"admin_versioning_{uid}",
             hashed_password=security.get_password_hash("Secret123!"),
             full_name="Admin Versioning",
             role=UserRole.ADMIN_ORG,
@@ -29,12 +31,12 @@ async def test_resource_versioning_auto_increment_and_strict_data_import(async_c
         await session.refresh(admin_user)
 
         org = Organization(
-            name="Société Cacao Durable",
-            code="SWT-CACAO-DURABLE",
+            name=f"Société Cacao Durable {uid}",
+            code=f"SWT-CACAO-DURABLE-{uid.upper()}",
             country="Côte d'Ivoire",
             type="Coopérative",
             owner_id=admin_user.id,
-            contact_email="contact@cacao-durable.ci",
+            contact_email=f"contact_{uid}@cacao-durable.ci",
             status=OrgStatusEnum.ACTIVE.value,
         )
         session.add(org)

@@ -1,3 +1,4 @@
+import copy
 import logging
 from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime, timezone
@@ -5,17 +6,23 @@ from fastapi import HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, or_, func, desc
 from sqlalchemy.orm import selectinload
+from sqlalchemy.orm.attributes import flag_modified
 
-from app.models.campaign.campaign import Campaign, CampaignStatus, CampaignType
+from app.models.campaign.campaign import Campaign, CampaignStatus
+from app.models.campaign.campaign_version import CampaignVersion, CampaignVersionStatus
+from app.models.project.project import Project
+from app.models.form.form import Form
 from app.models.organization.organization import Organization
 from app.models.organization.member import OrganizationMember
 from app.models.organization.role import OrganizationRole
-from app.models.plugin.plugin import Plugin, OrganizationPlugin, OrgPluginStatus
 from app.models.user.user import User, UserRole
 from app.schemas.campaign.campaign import (
     CampaignCreate,
     CampaignUpdate,
     CampaignStatusUpdate,
+    CampaignVersionCreate,
+    CampaignVersionUpdate,
+    CampaignVersionCloneRequest,
 )
 from app.services.organization.organization_service import organization_service
 from app.services.notification.notification_service import notification_service
@@ -37,23 +44,18 @@ class CampaignService:
         """
         is_super_admin = user.role == UserRole.SUPER_ADMIN or str(user.role).upper() == "SUPER_ADMIN"
 
-        # Super Admin peut opérer sur une organisation spécifique ou globalement
-        if is_super_admin and requested_org_id:
-            org_res = await db.execute(select(Organization).where(Organization.id == requested_org_id))
-            org = org_res.scalars().first()
-            if not org:
-                raise HTTPException(status_code=404, detail="Organisation introuvable.")
-            return org, True
+        if is_super_admin:
+            if requested_org_id:
+                org_res = await db.execute(select(Organization).where(Organization.id == requested_org_id))
+                return org_res.scalars().first(), True
+            return None, True
 
         org = await organization_service.get_user_organization(db, user)
-        if not org and not is_super_admin:
+        if not org:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Vous devez être rattaché à une organisation active pour accéder aux campagnes."
             )
-
-        if is_super_admin:
-            return org, True
 
         is_owner = org.owner_id == user.id or (org.contact_email and org.contact_email.lower() == user.email.lower())
         is_org_admin = user.role == UserRole.ADMIN_ORG or str(user.role).upper() == "ADMIN_ORG"
@@ -121,7 +123,7 @@ class CampaignService:
         db: AsyncSession,
         user: User,
         status_filter: Optional[str] = None,
-        campaign_type: Optional[str] = None,
+        visibility_filter: Optional[str] = None,
         plugin_code: Optional[str] = None,
         search: Optional[str] = None,
         skip: int = 0,
@@ -129,15 +131,15 @@ class CampaignService:
         org_id: Optional[int] = None
     ) -> Dict[str, Any]:
         """
-        Liste les campagnes accessibles :
-        - Les campagnes propres à l'organisation (tenant-owned ou preconfigured)
-        - ET les campagnes partagées (is_shared == True) des plugins actifs installés dans l'organisation.
+        Liste les campagnes disponibles :
+        - Pour le Super Admin : toutes les campagnes maîtresses de la plateforme.
+        - Pour une organisation cliente : campagnes publiques (ou autorisées).
         """
         is_super_admin = user.role == UserRole.SUPER_ADMIN or str(user.role).upper() == "SUPER_ADMIN"
-        org, _ = await self._resolve_user_org_and_permissions(db, user, action="view", requested_org_id=org_id)
-        target_org_id = org.id if org else None
+        if not is_super_admin:
+            await self._resolve_user_org_and_permissions(db, user, action="view", requested_org_id=org_id)
 
-        query = select(Campaign).order_by(desc(Campaign.created_at))
+        query = select(Campaign).options(selectinload(Campaign.versions)).order_by(desc(Campaign.created_at))
         count_stmt = select(func.count(Campaign.id))
         open_stmt = select(func.count(Campaign.id)).where(Campaign.status == CampaignStatus.OPEN.value)
         draft_stmt = select(func.count(Campaign.id)).where(Campaign.status == CampaignStatus.DRAFT.value)
@@ -145,39 +147,18 @@ class CampaignService:
             Campaign.status.in_([CampaignStatus.CLOSED.value, CampaignStatus.ARCHIVED.value])
         )
 
-        if target_org_id:
-            # Récupérer les plugins installés par cette organisation
-            inst_res = await db.execute(
-                select(OrganizationPlugin.plugin_id).where(
-                    OrganizationPlugin.organization_id == target_org_id,
-                    OrganizationPlugin.status == OrgPluginStatus.INSTALLED.value
-                )
-            )
-            installed_plugin_ids = list(inst_res.scalars().all())
-
-            # Condition d'accès : Campagne détenue par l'organisation OU Campagne partagée liée à un plugin installé
-            if installed_plugin_ids:
-                org_condition = or_(
-                    Campaign.organization_id == target_org_id,
-                    and_(Campaign.is_shared == True, Campaign.plugin_id.in_(installed_plugin_ids))
-                )
-            else:
-                org_condition = (Campaign.organization_id == target_org_id)
-
-            query = query.where(org_condition)
-            count_stmt = count_stmt.where(org_condition)
-            open_stmt = open_stmt.where(org_condition)
-            draft_stmt = draft_stmt.where(org_condition)
-            closed_stmt = closed_stmt.where(org_condition)
+        if not is_super_admin:
+            query = query.where(Campaign.visibility == "public")
+            count_stmt = count_stmt.where(Campaign.visibility == "public")
+            open_stmt = open_stmt.where(Campaign.visibility == "public")
+            draft_stmt = draft_stmt.where(Campaign.visibility == "public")
+            closed_stmt = closed_stmt.where(Campaign.visibility == "public")
 
         if status_filter and status_filter != "all":
             query = query.where(Campaign.status == status_filter)
 
-        if campaign_type and campaign_type != "all":
-            query = query.where(Campaign.campaign_type == campaign_type)
-
-        if plugin_code and plugin_code != "all":
-            query = query.where(Campaign.plugin_code == plugin_code)
+        if visibility_filter and visibility_filter != "all":
+            query = query.where(Campaign.visibility == visibility_filter)
 
         if search and search.strip():
             term = f"%{search.strip().lower()}%"
@@ -221,36 +202,25 @@ class CampaignService:
         user: User
     ) -> Campaign:
         """
-        Récupère une campagne par son identifiant avec vérification d'isolation tenant ou de partage de plugin.
+        Récupère une campagne par son identifiant.
         """
         is_super_admin = user.role == UserRole.SUPER_ADMIN or str(user.role).upper() == "SUPER_ADMIN"
-        org, _ = await self._resolve_user_org_and_permissions(db, user, action="view")
-
-        res = await db.execute(select(Campaign).where(Campaign.id == campaign_id))
+        res = await db.execute(
+            select(Campaign)
+            .options(selectinload(Campaign.versions))
+            .where(Campaign.id == campaign_id)
+        )
         campaign = res.scalars().first()
         if not campaign:
             raise HTTPException(status_code=404, detail="Campagne introuvable.")
 
-        if is_super_admin:
-            return campaign
-
-        # Si la campagne appartient à l'organisation de l'utilisateur
-        if org and campaign.organization_id == org.id:
-            return campaign
-
-        # Si la campagne est partagée par un plugin installé dans l'organisation de l'utilisateur
-        if campaign.is_shared and campaign.plugin_id and org:
-            inst_res = await db.execute(
-                select(OrganizationPlugin).where(
-                    OrganizationPlugin.organization_id == org.id,
-                    OrganizationPlugin.plugin_id == campaign.plugin_id,
-                    OrganizationPlugin.status == OrgPluginStatus.INSTALLED.value
-                )
+        if not is_super_admin and campaign.visibility != "public":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Accès restreint à cette campagne."
             )
-            if inst_res.scalars().first():
-                return campaign
 
-        raise HTTPException(status_code=403, detail="Accès interdit à cette campagne.")
+        return campaign
 
     async def create_campaign(
         self,
@@ -260,57 +230,21 @@ class CampaignService:
         org_id: Optional[int] = None
     ) -> Campaign:
         """
-        Crée une nouvelle campagne :
-        - Soit propre à l'organisation (tenant / preconfigured).
-        - Soit partagée au niveau du plugin (is_shared == True, réservé au Super Admin).
+        Crée une nouvelle campagne maîtresse avec sa version initiale 1.0.0.
         """
         is_super_admin = user.role == UserRole.SUPER_ADMIN or str(user.role).upper() == "SUPER_ADMIN"
+        if not is_super_admin:
+            await self._resolve_user_org_and_permissions(db, user, action="create_edit", requested_org_id=org_id)
 
-        is_shared_request = bool(data.is_shared or data.scope == "plugin_shared")
-
-        if is_shared_request and not is_super_admin:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Seul le Super Administrateur de la plateforme peut créer une campagne partagée au niveau d'un plugin."
-            )
-
-        org = None
-        if not is_shared_request or org_id:
-            org, _ = await self._resolve_user_org_and_permissions(
-                db, user, action="create_edit", requested_org_id=org_id
-            )
-            if not org and not is_super_admin:
-                raise HTTPException(status_code=400, detail="Impossible de créer une campagne sans organisation rattachée.")
-
-        target_org_id = org.id if org else None
         clean_code = data.code.strip().lower()
 
-        # Vérifier l'unicité du code
-        if target_org_id:
-            res_check = await db.execute(
-                select(Campaign).where(
-                    Campaign.organization_id == target_org_id,
-                    Campaign.code == clean_code
-                )
+        # Vérifier l'unicité stricte et globale du code identifiant de la campagne
+        code_check = await db.execute(select(Campaign).where(func.lower(Campaign.code) == clean_code))
+        if code_check.scalars().first():
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Une campagne avec le code technique '{clean_code}' existe déjà. Le code identifiant doit être strictement unique."
             )
-            if res_check.scalars().first():
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Une campagne avec le code '{clean_code}' existe déjà dans votre organisation."
-                )
-        elif is_shared_request and data.plugin_id:
-            res_check = await db.execute(
-                select(Campaign).where(
-                    Campaign.is_shared == True,
-                    Campaign.plugin_id == data.plugin_id,
-                    Campaign.code == clean_code
-                )
-            )
-            if res_check.scalars().first():
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Une campagne partagée avec le code '{clean_code}' existe déjà pour ce plugin."
-                )
 
         if data.start_date and data.end_date:
             s = data.start_date if data.start_date.tzinfo else data.start_date.replace(tzinfo=timezone.utc)
@@ -321,40 +255,33 @@ class CampaignService:
                     detail="La date de fin de la campagne doit être postérieure à la date de début."
                 )
 
-        plugin_id = data.plugin_id
-        plugin_code = data.plugin_code
-        if plugin_id and not plugin_code:
-            p_res = await db.execute(select(Plugin).where(Plugin.id == plugin_id))
-            plug = p_res.scalars().first()
-            if plug:
-                plugin_code = plug.code
-
-        final_scope = "plugin_shared" if is_shared_request else (data.scope or "tenant")
-        final_is_shared = is_shared_request
+        initial_version_number = (getattr(data, "initial_version", None) or "1.0.0").strip()
 
         campaign = Campaign(
-            organization_id=target_org_id,
-            plugin_id=plugin_id,
-            plugin_code=plugin_code,
-            scope=final_scope,
-            is_shared=final_is_shared,
-            is_immutable=bool(data.is_immutable),
-            immutable_fields=data.immutable_fields or [],
-            parent_template_id=data.parent_template_id,
             name=data.name.strip(),
             code=clean_code,
-            campaign_type=data.campaign_type,
-            status=CampaignStatus.DRAFT.value,
             description=data.description,
-            objectives=data.objectives,
-            targets=data.targets or {},
+            visibility=getattr(data, "visibility", "public") or "public",
+            status=CampaignStatus.DRAFT.value,
+            version=initial_version_number,
+            settings=data.settings or {},
+            created_by_id=user.id
+        )
+
+        db.add(campaign)
+        await db.flush()
+
+        # Création immédiate de la version 1.0.0
+        initial_version = CampaignVersion(
+            campaign_id=campaign.id,
+            version_number=initial_version_number,
+            status=CampaignVersionStatus.DRAFT.value,
+            description=data.description,
             start_date=data.start_date,
             end_date=data.end_date,
-            budget=data.budget,
-            currency=data.currency,
-            target_forms=data.target_forms or [],
-            target_projects=data.target_projects or [],
             settings=data.settings or {},
+            template_governance={"visibility": getattr(data, "visibility", "public") or "public"},
+            changelog="Version initiale créée.",
             metrics={
                 "progress_percentage": 0,
                 "total_submissions": 0,
@@ -362,12 +289,11 @@ class CampaignService:
             },
             created_by_id=user.id
         )
-
-        db.add(campaign)
+        db.add(initial_version)
         await db.commit()
         await db.refresh(campaign)
 
-        logger.info(f"[CAMPAIGN_CREATED] Campagne '{campaign.name}' (ID: {campaign.id}, Scope: {final_scope}, Shared: {final_is_shared}) créée par {user.email}")
+        logger.info(f"[CAMPAIGN_CREATED] Campagne '{campaign.name}' (ID: {campaign.id}) créée par {user.email}")
         return campaign
 
     async def update_campaign(
@@ -378,94 +304,46 @@ class CampaignService:
         user: User
     ) -> Campaign:
         """
-        Met à jour les paramètres d'une campagne.
-        Gouvernance stricte :
-        - Si la campagne est partagée (is_shared == True), seul le Super Admin peut la modifier.
-        - Si la campagne est immuable (is_immutable == True), les champs protégés sont bloqués.
-        - Si la campagne est clôturée ou archivée, elle est scellée pour audit.
+        Met à jour les informations globales d'une campagne.
         """
         is_super_admin = user.role == UserRole.SUPER_ADMIN or str(user.role).upper() == "SUPER_ADMIN"
+        if not is_super_admin:
+            await self._resolve_user_org_and_permissions(db, user, action="create_edit")
+
         campaign = await self.get_campaign_by_id(db, campaign_id, user)
 
-        # 1. Règle de partage : Seul Super Admin modifie une campagne partagée
-        if campaign.is_shared and not is_super_admin:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Cette campagne est partagée au niveau du plugin et gérée exclusivement par le Super Administrateur de la plateforme."
-            )
-
-        if not campaign.is_shared:
-            await self._resolve_user_org_and_permissions(
-                db, user, action="create_edit", requested_org_id=campaign.organization_id
-            )
-
-        # 2. Règle de scellement audit : Clôturée ou archivée
         if campaign.status in [CampaignStatus.ARCHIVED.value, CampaignStatus.CLOSED.value]:
             raise HTTPException(
                 status_code=400,
                 detail="Une campagne clôturée ou archivée est scellée et ne peut plus être modifiée."
             )
 
-        # 3. Règle d'immuabilité : Vérifier les champs verrouillés
-        if campaign.is_immutable and not is_super_admin:
-            locked = campaign.immutable_fields or ["campaign_type", "target_forms", "code"]
-            if "*" in locked:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Cette campagne est intégralement verrouillée (immuable) selon les spécifications strictes du plugin."
+        if data.code is not None:
+            clean_c = data.code.strip().lower()
+            if clean_c != campaign.code:
+                chk_c = await db.execute(
+                    select(Campaign).where(
+                        func.lower(Campaign.code) == clean_c,
+                        Campaign.id != campaign.id
+                    )
                 )
-            if "name" in locked and data.name is not None and data.name.strip() != campaign.name:
-                raise HTTPException(status_code=400, detail="Le nom de cette campagne est immuable et verrouillé par le plugin.")
-            if "description" in locked and data.description is not None:
-                raise HTTPException(status_code=400, detail="La description certifiée de cette campagne est immuable.")
-            if "objectives" in locked and data.objectives is not None:
-                raise HTTPException(status_code=400, detail="Les objectifs réglementaires de cette campagne sont immuables.")
-            if "target_forms" in locked and data.target_forms is not None:
-                raise HTTPException(status_code=400, detail="Les formulaires obligatoires rattachés à cette campagne sont immuables.")
+                if chk_c.scalars().first():
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=f"Une campagne avec le code technique '{clean_c}' existe déjà. Le code doit être strictement unique."
+                    )
+                campaign.code = clean_c
 
-        # Application des modifications permises
         if data.name is not None:
             campaign.name = data.name.strip()
         if data.description is not None:
             campaign.description = data.description
-        if data.objectives is not None:
-            campaign.objectives = data.objectives
-        if data.targets is not None:
-            campaign.targets = data.targets
-        if data.start_date is not None:
-            campaign.start_date = data.start_date
-        if data.end_date is not None:
-            campaign.end_date = data.end_date
-        if data.budget is not None:
-            campaign.budget = data.budget
-        if data.currency is not None:
-            campaign.currency = data.currency
-        if data.target_forms is not None:
-            campaign.target_forms = data.target_forms
-        if data.target_projects is not None:
-            campaign.target_projects = data.target_projects
+        if data.visibility is not None:
+            campaign.visibility = data.visibility
+        if getattr(data, "version", None) is not None:
+            campaign.version = data.version
         if data.settings is not None:
             campaign.settings = data.settings
-
-        if is_super_admin:
-            if data.is_shared is not None:
-                campaign.is_shared = data.is_shared
-            if data.is_immutable is not None:
-                campaign.is_immutable = data.is_immutable
-            if data.immutable_fields is not None:
-                campaign.immutable_fields = data.immutable_fields
-            if data.scope is not None:
-                campaign.scope = data.scope
-
-        # Chronologie des dates
-        if campaign.start_date and campaign.end_date:
-            s = campaign.start_date if campaign.start_date.tzinfo else campaign.start_date.replace(tzinfo=timezone.utc)
-            e = campaign.end_date if campaign.end_date.tzinfo else campaign.end_date.replace(tzinfo=timezone.utc)
-            if e < s:
-                raise HTTPException(
-                    status_code=400,
-                    detail="La date de fin de la campagne doit être postérieure à la date de début."
-                )
 
         await db.commit()
         await db.refresh(campaign)
@@ -480,21 +358,12 @@ class CampaignService:
     ) -> Campaign:
         """
         Gère les transitions de statut (open, paused, closed, archived).
-        Pour une campagne partagée, seul le Super Admin peut changer le statut.
         """
         is_super_admin = user.role == UserRole.SUPER_ADMIN or str(user.role).upper() == "SUPER_ADMIN"
+        if not is_super_admin:
+            await self._resolve_user_org_and_permissions(db, user, action="create_edit")
+
         campaign = await self.get_campaign_by_id(db, campaign_id, user)
-
-        if campaign.is_shared and not is_super_admin:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Seul le Super Administrateur peut changer le statut opérationnel d'une campagne partagée au niveau du plugin."
-            )
-
-        if not campaign.is_shared:
-            await self._resolve_user_org_and_permissions(
-                db, user, action="create_edit", requested_org_id=campaign.organization_id
-            )
 
         new_status = data.status.strip().lower()
         valid_statuses = [s.value for s in CampaignStatus]
@@ -516,8 +385,6 @@ class CampaignService:
             campaign.status = CampaignStatus.CLOSED.value
             campaign.closed_at = now
             campaign.closed_by_id = user.id
-            if campaign.metrics:
-                campaign.metrics["progress_percentage"] = 100
         elif new_status == CampaignStatus.ARCHIVED.value:
             campaign.status = CampaignStatus.ARCHIVED.value
             if not campaign.closed_at:
@@ -525,22 +392,6 @@ class CampaignService:
                 campaign.closed_by_id = user.id
         elif new_status == CampaignStatus.OPEN.value:
             campaign.status = CampaignStatus.OPEN.value
-            if not campaign.start_date:
-                campaign.start_date = now
-
-            # Notification si organisation rattachée
-            if campaign.organization_id:
-                org_res = await db.execute(select(Organization).where(Organization.id == campaign.organization_id))
-                org = org_res.scalars().first()
-                if org and org.owner_id:
-                    await notification_service.create_notification(
-                        db=db,
-                        user_id=org.owner_id,
-                        title=f"Campagne ouverte : {campaign.name}",
-                        message=f"La campagne '{campaign.name}' est désormais ouverte et active pour la collecte de données.",
-                        link=f"/dashboard/campaigns/{campaign.id}",
-                        type="info"
-                    )
         else:
             campaign.status = new_status
 
@@ -555,22 +406,13 @@ class CampaignService:
         user: User
     ) -> Dict[str, Any]:
         """
-        Supprime une campagne brouillon.
-        Seul le Super Admin peut supprimer une campagne partagée brouillon.
+        Supprime définitivement une campagne brouillon.
         """
         is_super_admin = user.role == UserRole.SUPER_ADMIN or str(user.role).upper() == "SUPER_ADMIN"
+        if not is_super_admin:
+            await self._resolve_user_org_and_permissions(db, user, action="delete")
+
         campaign = await self.get_campaign_by_id(db, campaign_id, user)
-
-        if campaign.is_shared and not is_super_admin:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Seul le Super Administrateur peut supprimer une campagne partagée."
-            )
-
-        if not campaign.is_shared:
-            await self._resolve_user_org_and_permissions(
-                db, user, action="delete", requested_org_id=campaign.organization_id
-            )
 
         if campaign.status != CampaignStatus.DRAFT.value:
             raise HTTPException(
@@ -588,77 +430,910 @@ class CampaignService:
             "campaign_id": campaign_id
         }
 
-    async def provision_plugin_templates(
+    # =========================================================================
+    # GESTION DES VERSIONS DE LA CAMPAGNE (VERSIONING PATTERN)
+    # =========================================================================
+
+    @classmethod
+    def _populate_latest_version_attributes(cls, campaign: Campaign) -> None:
+        """
+        Synchronise les données miroir de la campagne avec la version active ou la plus récente.
+        """
+        if not campaign.versions:
+            return
+        active_ver = next(
+            (v for v in campaign.versions if v.status in [CampaignVersionStatus.OPEN.value, CampaignVersionStatus.ACTIVE.value]),
+            campaign.versions[0]
+        )
+        campaign.version = active_ver.version_number
+        campaign.status = active_ver.status
+        if active_ver.description is not None:
+            campaign.description = active_ver.description
+
+    async def list_campaign_versions(
         self,
         db: AsyncSession,
-        org_id: int,
-        plugin: Plugin,
-        version: Any,
+        campaign_id: int,
         user: User
-    ) -> List[Campaign]:
+    ) -> List[CampaignVersion]:
         """
-        Instancie automatiquement les campagnes préconfigurées déclarées dans la version du plugin
-        lors de son intégration dans l'espace de travail d'une organisation.
-        Supporte les configurations immuables (locked) et personnalisables (customizable).
+        Retourne l'historique complet et ordonné des versions d'une campagne.
         """
-        pkg = version.package_data or {}
-        tools = pkg.get("tools", {})
-        camp_config = tools.get("campaigns", {})
-        templates = camp_config.get("templates", [])
-        if not templates:
-            return []
+        campaign = await self.get_campaign_by_id(db, campaign_id, user)
+        res = await db.execute(
+            select(CampaignVersion)
+            .where(CampaignVersion.campaign_id == campaign.id)
+            .order_by(desc(CampaignVersion.id))
+        )
+        return list(res.scalars().all())
 
-        created_campaigns = []
-        for tpl in templates:
-            tpl_code = tpl.get("code", "").strip().lower()
-            if not tpl_code:
-                continue
+    async def get_campaign_version(
+        self,
+        db: AsyncSession,
+        campaign_id: int,
+        version_id: int,
+        user: User
+    ) -> CampaignVersion:
+        """
+        Récupère une version spécifique d'une campagne.
+        """
+        campaign = await self.get_campaign_by_id(db, campaign_id, user)
+        res = await db.execute(
+            select(CampaignVersion).where(
+                CampaignVersion.campaign_id == campaign.id,
+                CampaignVersion.id == version_id
+            )
+        )
+        ver = res.scalars().first()
+        if not ver:
+            raise HTTPException(status_code=404, detail="Version de campagne introuvable.")
+        return ver
 
-            # Vérifier si déjà instancié pour cette organisation
-            res = await db.execute(
-                select(Campaign).where(
-                    Campaign.organization_id == org_id,
-                    Campaign.code == tpl_code
+    async def create_campaign_version(
+        self,
+        db: AsyncSession,
+        campaign_id: int,
+        data: CampaignVersionCreate,
+        user: User
+    ) -> Campaign:
+        """
+        Crée une nouvelle version incrémentale (brouillon) pour une campagne existante.
+        """
+        campaign = await self.get_campaign_by_id(db, campaign_id, user)
+
+        new_v_num = data.version_number.strip()
+
+        # Vérifier si la version existe déjà
+        chk_ver = await db.execute(
+            select(CampaignVersion).where(
+                CampaignVersion.campaign_id == campaign.id,
+                CampaignVersion.version_number == new_v_num
+            )
+        )
+        if chk_ver.scalars().first():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"La version '{new_v_num}' existe déjà pour cette campagne."
+            )
+
+        new_version = CampaignVersion(
+            campaign_id=campaign.id,
+            version_number=new_v_num,
+            status=CampaignVersionStatus.DRAFT.value,
+            description=data.description if data.description is not None else campaign.description,
+            objectives=data.objectives,
+            targets=data.targets or {},
+            start_date=data.start_date,
+            end_date=data.end_date,
+            budget=data.budget,
+            currency=data.currency or "XOF",
+            target_forms=data.target_forms or [],
+            target_projects=data.target_projects or [],
+            settings=data.settings or {},
+            template_governance=data.template_governance or {},
+            changelog=data.changelog or f"Version {new_v_num} créée.",
+            metrics={"progress_percentage": 0, "total_submissions": 0, "validated_submissions": 0},
+            created_by_id=user.id
+        )
+        db.add(new_version)
+        await db.flush()
+        await db.refresh(campaign)
+        self._populate_latest_version_attributes(campaign)
+        await db.commit()
+        return await self.get_campaign_by_id(db, campaign.id, user)
+
+    async def update_campaign_version(
+        self,
+        db: AsyncSession,
+        campaign_id: int,
+        version_id: int,
+        data: CampaignVersionUpdate,
+        user: User
+    ) -> Campaign:
+        """
+        Met à jour les paramètres d'une version spécifique d'une campagne.
+        """
+        campaign = await self.get_campaign_by_id(db, campaign_id, user)
+        ver = await self.get_campaign_version(db, campaign_id, version_id, user)
+
+        if ver.status in [CampaignVersionStatus.CLOSED.value, CampaignVersionStatus.ARCHIVED.value]:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cette version de campagne est clôturée/archivée et ne peut plus être modifiée."
+            )
+
+        # Règle d'immuabilité : une version publiée/scellée ne peut plus voir ses paramètres de gouvernance modifiés
+        if data.template_governance is not None and ver.status in [CampaignVersionStatus.OPEN.value, CampaignVersionStatus.ACTIVE.value]:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Impossible de modifier les paramètres d'une version déjà publiée ou scellée."
+            )
+
+        # Règle de gouvernance : interdiction de modifier les données de la version si allow_edit_version == False
+        gov = ver.template_governance or {}
+        allow_edit = gov.get("allow_edit_version", gov.get("allow_edit", True))
+        if allow_edit is False and data.template_governance is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"La modification des données de la version « v{ver.version_number} » a été désactivée dans ses paramètres de gouvernance."
+            )
+
+        if data.description is not None:
+            ver.description = data.description
+        if data.objectives is not None:
+            ver.objectives = data.objectives
+        if data.targets is not None:
+            ver.targets = data.targets
+            flag_modified(ver, "targets")
+        if data.start_date is not None:
+            ver.start_date = data.start_date
+        if data.end_date is not None:
+            ver.end_date = data.end_date
+        if data.budget is not None:
+            ver.budget = data.budget
+        if data.currency is not None:
+            ver.currency = data.currency
+        if data.target_forms is not None:
+            ver.target_forms = data.target_forms
+            flag_modified(ver, "target_forms")
+        if data.target_projects is not None:
+            ver.target_projects = data.target_projects
+            flag_modified(ver, "target_projects")
+            await self._cascade_project_forms_to_campaign_version(db, ver)
+        if data.settings is not None:
+            ver.settings = data.settings
+            flag_modified(ver, "settings")
+        if data.template_governance is not None:
+            current_gov = dict(ver.template_governance or {})
+            current_gov.update(data.template_governance)
+            ver.template_governance = current_gov
+            flag_modified(ver, "template_governance")
+            if "visibility" in data.template_governance and data.template_governance["visibility"]:
+                campaign.visibility = str(data.template_governance["visibility"])
+        if data.changelog is not None:
+            ver.changelog = data.changelog
+        if data.status is not None:
+            ver.status = data.status
+
+        # Synchroniser les miroirs de campagne avec la version courante
+        self._populate_latest_version_attributes(campaign)
+        await db.commit()
+        return await self.get_campaign_by_id(db, campaign_id, user)
+
+    async def publish_campaign_version(
+        self,
+        db: AsyncSession,
+        campaign_id: int,
+        version_id: int,
+        user: User
+    ) -> Campaign:
+        """
+        Publie et active la version sélectionnée pour une campagne.
+        Archive les versions actives ou ouvertes précédentes.
+        Met à jour le statut et la version courante de la campagne.
+        """
+        campaign = await self.get_campaign_by_id(db, campaign_id, user)
+        ver = await self.get_campaign_version(db, campaign_id, version_id, user)
+
+        # Vérifier la gouvernance de la version
+        gov = ver.template_governance or {}
+        allow_publish = gov.get("allow_publish_version", gov.get("allow_publish", True))
+        if allow_publish is False:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"La publication de la version « v{ver.version_number} » a été désactivée dans ses paramètres de gouvernance."
+            )
+
+        # Si déjà active/ouverte et déjà la version active de la campagne, retourner directement
+        if ver.status in [CampaignVersionStatus.ACTIVE.value, CampaignVersionStatus.OPEN.value] and campaign.version == ver.version_number:
+            return campaign
+
+        # Activer et ouvrir la version ciblée (les versions publiées antérieures restent publiées)
+        ver.status = CampaignVersionStatus.OPEN.value
+        ver.updated_at = datetime.now(timezone.utc)
+
+        # Mettre à jour la campagne globale
+        campaign.status = CampaignStatus.OPEN.value
+        campaign.version = ver.version_number
+        if ver.description is not None:
+            campaign.description = ver.description
+
+        self._populate_latest_version_attributes(campaign)
+        await db.commit()
+        return await self.get_campaign_by_id(db, campaign_id, user)
+
+    async def set_active_campaign_version(
+        self,
+        db: AsyncSession,
+        campaign_id: int,
+        version_id: int,
+        user: User
+    ) -> Campaign:
+        """
+        Définit une version spécifique publiée ou archivée comme étant la version active courante de la campagne.
+        Archive automatiquement les autres versions actives/ouvertes.
+        """
+        campaign = await self.get_campaign_by_id(db, campaign_id, user)
+        ver = await self.get_campaign_version(db, campaign_id, version_id, user)
+
+        if ver.status == CampaignVersionStatus.DRAFT.value:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Une version en brouillon ne peut pas être directement activée. Veuillez d'abord publier la version « v{ver.version_number} »."
+            )
+
+        # Mettre la version ciblée en statut OPEN (active)
+        ver.status = CampaignVersionStatus.OPEN.value
+        ver.updated_at = datetime.now(timezone.utc)
+
+        # Archiver les autres versions précédemment actives ou ouvertes de cette campagne
+        other_versions_res = await db.execute(
+            select(CampaignVersion).where(
+                CampaignVersion.campaign_id == campaign.id,
+                CampaignVersion.id != ver.id
+            )
+        )
+        for other_v in other_versions_res.scalars().all():
+            if other_v.status in [CampaignVersionStatus.OPEN.value, CampaignVersionStatus.ACTIVE.value]:
+                other_v.status = CampaignVersionStatus.ARCHIVED.value
+                other_v.updated_at = datetime.now(timezone.utc)
+
+        campaign.version = ver.version_number
+        campaign.status = CampaignStatus.OPEN.value
+        if ver.description is not None:
+            campaign.description = ver.description
+
+        self._populate_latest_version_attributes(campaign)
+        await db.commit()
+        return await self.get_campaign_by_id(db, campaign_id, user)
+
+    async def clone_campaign_version(
+        self,
+        db: AsyncSession,
+        campaign_id: int,
+        req: CampaignVersionCloneRequest,
+        user: User
+    ) -> Campaign:
+        """
+        Clone une version existante pour créer une nouvelle version de campagne incrémentale.
+        """
+        campaign = await self.get_campaign_by_id(db, campaign_id, user)
+
+        # Vérifier si un brouillon existe déjà
+        draft_chk = await db.execute(
+            select(CampaignVersion).where(
+                CampaignVersion.campaign_id == campaign.id,
+                CampaignVersion.status == CampaignVersionStatus.DRAFT.value
+            )
+        )
+        existing_draft = draft_chk.scalars().first()
+        if existing_draft:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Une version en brouillon existe déjà (« v{existing_draft.version_number} »). Veuillez la publier ou la supprimer avant de cloner une nouvelle version."
+            )
+
+        new_v_num = req.new_version_number.strip()
+        chk_ver = await db.execute(
+            select(CampaignVersion).where(
+                CampaignVersion.campaign_id == campaign.id,
+                CampaignVersion.version_number == new_v_num
+            )
+        )
+        if chk_ver.scalars().first():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"La version '{new_v_num}' existe déjà pour cette campagne."
+            )
+
+        # Résoudre la version source
+        source_ver: Optional[CampaignVersion] = None
+        if req.source_version_id:
+            src_res = await db.execute(
+                select(CampaignVersion).where(
+                    CampaignVersion.campaign_id == campaign.id,
+                    CampaignVersion.id == req.source_version_id
                 )
             )
-            if res.scalars().first():
-                continue
+            source_ver = src_res.scalars().first()
+        elif campaign.versions:
+            source_ver = campaign.versions[0]
 
-            is_imm = bool(tpl.get("is_immutable", False))
-            imm_fields = tpl.get("immutable_fields", ["campaign_type", "target_forms", "code"] if is_imm else [])
+        if source_ver:
+            src_gov = source_ver.template_governance or {}
+            allow_clone = src_gov.get("allow_clone_version", src_gov.get("allow_clone", True))
+            if allow_clone is False:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Le clonage de la version « v{source_ver.version_number} » a été désactivé dans ses paramètres de gouvernance."
+                )
 
-            new_camp = Campaign(
-                organization_id=org_id,
-                plugin_id=plugin.id,
-                plugin_code=plugin.code,
-                scope="preconfigured",
-                is_shared=False,
-                is_immutable=is_imm,
-                immutable_fields=imm_fields,
-                parent_template_id=tpl.get("id"),
-                name=tpl.get("name", "Campagne Prédéfinie"),
-                code=tpl_code,
-                campaign_type=tpl.get("campaign_type", "harvest"),
-                status=CampaignStatus.DRAFT.value,
-                description=tpl.get("description"),
-                objectives=tpl.get("objectives"),
-                targets=tpl.get("targets", {}),
-                budget=tpl.get("budget"),
-                currency=tpl.get("currency", "XOF"),
-                target_forms=tpl.get("target_forms", []),
-                target_projects=tpl.get("target_projects", []),
-                settings=tpl.get("settings", {}),
-                metrics={"progress_percentage": 0, "total_submissions": 0, "validated_submissions": 0},
-                created_by_id=user.id
+        should_copy_scope = bool(getattr(req, "copy_scope", False))
+
+        new_version = CampaignVersion(
+            campaign_id=campaign.id,
+            version_number=new_v_num,
+            status=CampaignVersionStatus.DRAFT.value,
+            description=source_ver.description if source_ver else campaign.description,
+            objectives=source_ver.objectives if source_ver else None,
+            targets=copy.deepcopy(source_ver.targets) if source_ver and source_ver.targets else {},
+            start_date=source_ver.start_date if source_ver else None,
+            end_date=source_ver.end_date if source_ver else None,
+            budget=source_ver.budget if source_ver else None,
+            currency=source_ver.currency if source_ver else "XOF",
+            target_forms=copy.deepcopy(source_ver.target_forms) if (should_copy_scope and source_ver and source_ver.target_forms) else [],
+            target_projects=copy.deepcopy(source_ver.target_projects) if (should_copy_scope and source_ver and source_ver.target_projects) else [],
+            settings=copy.deepcopy(source_ver.settings) if source_ver and source_ver.settings else {},
+            template_governance=copy.deepcopy(source_ver.template_governance) if source_ver and source_ver.template_governance else {"visibility": campaign.visibility},
+            changelog=req.changelog or f"Cloné depuis v{source_ver.version_number if source_ver else 'initial'}.",
+            metrics={"progress_percentage": 0, "total_submissions": 0, "validated_submissions": 0},
+            created_by_id=user.id
+        )
+
+        db.add(new_version)
+        await db.flush()
+        await db.refresh(campaign)
+        self._populate_latest_version_attributes(campaign)
+        await db.commit()
+        return await self.get_campaign_by_id(db, campaign.id, user)
+
+    async def delete_campaign_version(
+        self,
+        db: AsyncSession,
+        campaign_id: int,
+        version_id: int,
+        user: User
+    ) -> Dict[str, Any]:
+        """
+        Supprime une version spécifique de la campagne.
+        """
+        campaign = await self.get_campaign_by_id(db, campaign_id, user)
+        ver = await self.get_campaign_version(db, campaign_id, version_id, user)
+
+        del_gov = ver.template_governance or {}
+        allow_delete = del_gov.get("allow_delete_version", True)
+        if allow_delete is False:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"La suppression de la version « v{ver.version_number} » a été désactivée dans ses paramètres de gouvernance."
             )
-            db.add(new_camp)
-            created_campaigns.append(new_camp)
 
-        if created_campaigns:
+        if ver.status not in [CampaignVersionStatus.DRAFT.value, CampaignVersionStatus.ARCHIVED.value]:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Impossible de supprimer une version active ou ouverte. Vous devez d'abord la clôturer ou l'archiver."
+            )
+
+        # Vérifier le nombre total de versions
+        count_res = await db.execute(
+            select(func.count(CampaignVersion.id)).where(CampaignVersion.campaign_id == campaign.id)
+        )
+        total_versions = count_res.scalar() or 0
+
+        if total_versions <= 1:
+            await db.delete(campaign)
             await db.commit()
-            logger.info(f"[CAMPAIGNS_PROVISIONED] {len(created_campaigns)} campagnes préconfigurées instanciées pour l'organisation ID {org_id}")
+            return {"message": "Dernière version supprimée : La campagne a été entièrement supprimée.", "deleted_campaign": True}
 
-        return created_campaigns
+        deleted_version_number = ver.version_number
+        await db.delete(ver)
+        await db.flush()
+
+        # Recharger les versions restantes pour réajuster le statut courant de la campagne
+        remaining_res = await db.execute(
+            select(CampaignVersion).where(CampaignVersion.campaign_id == campaign.id).order_by(desc(CampaignVersion.id))
+        )
+        campaign.versions = list(remaining_res.scalars().all())
+        self._populate_latest_version_attributes(campaign)
+        await db.commit()
+
+        return {
+            "message": f"La version « v{deleted_version_number} » a été supprimée avec succès.",
+            "deleted_version_number": deleted_version_number,
+            "deleted_campaign": False
+        }
+
+    # =========================================================================
+    # ASSOCIATIONS PROJETS & FORMULAIRES À UNE VERSION DE CAMPAGNE (CASCADE)
+    # =========================================================================
+
+    async def _cascade_project_forms_to_campaign_version(
+        self,
+        db: AsyncSession,
+        ver: CampaignVersion,
+    ) -> None:
+        """
+        Règle d'or de cascade :
+        Lorsqu'un projet est associé à une version de campagne,
+        tous les formulaires associés à ce projet le sont aussi automatiquement.
+        """
+        raw_projects = ver.target_projects or []
+        project_ids = []
+        for p in raw_projects:
+            if isinstance(p, dict):
+                p_id = p.get("id") or p.get("project_id")
+            elif isinstance(p, (int, str)) and str(p).isdigit():
+                p_id = int(p)
+            else:
+                p_id = None
+            if p_id:
+                project_ids.append(p_id)
+
+        if not project_ids:
+            return
+
+        current_forms = list(ver.target_forms or [])
+        existing_form_ids = set()
+        for f in current_forms:
+            if isinstance(f, dict):
+                fid = f.get("id") or f.get("form_id")
+            elif isinstance(f, (int, str)) and str(f).isdigit():
+                fid = int(f)
+            else:
+                fid = None
+            if fid:
+                existing_form_ids.add(fid)
+
+        stmt = select(Project).options(selectinload(Project.versions)).where(Project.id.in_(project_ids))
+        res = await db.execute(stmt)
+        projects = res.scalars().all()
+
+        forms_to_add_ids = set()
+        project_form_map = {}
+        project_form_version_map = {}
+        for proj in projects:
+            p_form_ids = set()
+            # 1. Depuis les settings de chaque version de projet
+            for p_ver in (proj.versions or []):
+                p_ver_settings = getattr(p_ver, "settings", None) or {}
+                for fid in p_ver_settings.get("attached_form_ids", []):
+                    if str(fid).isdigit():
+                        p_form_ids.add(int(fid))
+                for af in p_ver_settings.get("attached_form_versions", []):
+                    if isinstance(af, dict) and af.get("form_id") and str(af["form_id"]).isdigit():
+                        fid = int(af["form_id"])
+                        p_form_ids.add(fid)
+                        if af.get("version_number"):
+                            project_form_version_map[fid] = {
+                                "version_number": af.get("version_number"),
+                                "form_version_id": af.get("form_version_id"),
+                            }
+            # 2. Au cas où proj porterait un attribut settings direct
+            for fid in (getattr(proj, "settings", None) or {}).get("attached_form_ids", []):
+                if str(fid).isdigit():
+                    p_form_ids.add(int(fid))
+
+            for fid in p_form_ids:
+                forms_to_add_ids.add(fid)
+                project_form_map[fid] = proj
+
+        # Mettre à jour les formulaires déjà présents si version_number manquait
+        for cf in current_forms:
+            if isinstance(cf, dict):
+                cf_id = cf.get("id") or cf.get("form_id")
+                if cf_id in project_form_version_map and not cf.get("version_number"):
+                    cf["version_number"] = project_form_version_map[cf_id]["version_number"]
+                    if project_form_version_map[cf_id].get("form_version_id"):
+                        cf["form_version_id"] = project_form_version_map[cf_id]["form_version_id"]
+
+        if forms_to_add_ids:
+            f_stmt = select(Form).options(selectinload(Form.versions)).where(Form.id.in_(list(forms_to_add_ids)))
+            f_res = await db.execute(f_stmt)
+            forms_found = f_res.scalars().all()
+
+            for f_obj in forms_found:
+                # RÈGLE MÉTIER : On n'associe pas un formulaire en brouillon, uniquement les publiés
+                is_pub = (
+                    f_obj.status in ("published", "active")
+                    or any(v.status in ("published", "active", "archived") for v in (f_obj.versions or []))
+                )
+                if not is_pub:
+                    continue
+
+                parent_proj = project_form_map.get(f_obj.id)
+                ver_info = project_form_version_map.get(f_obj.id) or {}
+                ver_num = ver_info.get("version_number")
+                if not ver_num and f_obj.versions:
+                    pub_vers = [v for v in f_obj.versions if v.status in ("published", "active", "archived")]
+                    if pub_vers:
+                        ver_num = pub_vers[0].version_number
+
+                # Si déjà présent dans current_forms, on ne rajoute pas de doublon
+                if f_obj.id not in existing_form_ids:
+                    current_forms.append({
+                        "id": f_obj.id,
+                        "form_id": f_obj.id,
+                        "name": f_obj.name,
+                        "code": f_obj.code,
+                        "version_number": ver_num or f_obj.version or "1.0.0",
+                        "form_version_id": ver_info.get("form_version_id"),
+                        "source_project_id": parent_proj.id if parent_proj else None,
+                        "source_project_name": parent_proj.name if parent_proj else None,
+                        "attached_at": datetime.now(timezone.utc).isoformat(),
+                    })
+                    existing_form_ids.add(f_obj.id)
+
+            ver.target_forms = current_forms
+            flag_modified(ver, "target_forms")
+
+    async def attach_project_to_campaign_version(
+        self,
+        db: AsyncSession,
+        campaign_id: int,
+        version_id: int,
+        project_id: int,
+        user: User,
+    ) -> Campaign:
+        """
+        Associe un projet dans sa totalité à une version de campagne.
+        Règle : Seules les versions de campagne en brouillon peuvent être modifiées.
+        Seuls les projets publiés peuvent être associés.
+        Cascade automatique : tous les formulaires associés au projet sont intégrés.
+        """
+        campaign = await self.get_campaign_by_id(db, campaign_id, user)
+        ver = await self.get_campaign_version(db, campaign_id, version_id, user)
+
+        # RÈGLE MÉTIER : Interdiction de modifier une version scellée/publiée
+        if ver.status != CampaignVersionStatus.DRAFT.value:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Modification non autorisée : La version « v{ver.version_number} » de la campagne est déjà {ver.status}. Seules les versions en brouillon peuvent être configurées. Une fois publiée, le périmètre d'une version est scellé."
+            )
+
+        proj_stmt = select(Project).options(selectinload(Project.versions)).where(Project.id == project_id)
+        project = (await db.execute(proj_stmt)).scalars().first()
+        if not project:
+            raise HTTPException(status_code=404, detail=f"Projet #{project_id} introuvable.")
+
+        # RÈGLE MÉTIER : Exclusion stricte des projets en brouillon
+        has_published_version = any(
+            v.status in ("published", "active") for v in (project.versions or [])
+        )
+        if not has_published_version and getattr(project, "status", None) == "draft":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Action non autorisée : Le projet « {project.name} » est encore en brouillon. Seuls les projets publiés peuvent être associés à une version de campagne."
+            )
+
+        current_projects = list(ver.target_projects or [])
+        already_attached = any(
+            (p.get("id") == project.id or p.get("project_id") == project.id) if isinstance(p, dict) else p == project.id
+            for p in current_projects
+        )
+
+        if not already_attached:
+            current_projects.append({
+                "id": project.id,
+                "project_id": project.id,
+                "name": project.name,
+                "code": project.code,
+                "project_type": project.project_type,
+                "attached_at": datetime.now(timezone.utc).isoformat(),
+            })
+            ver.target_projects = current_projects
+            flag_modified(ver, "target_projects")
+
+        # Cascade automatique des formulaires associés au projet
+        await self._cascade_project_forms_to_campaign_version(db, ver)
+
+        await db.commit()
+        await db.refresh(ver)
+        await db.refresh(campaign)
+        self._populate_latest_version_attributes(campaign)
+        return campaign
+
+    async def detach_project_from_campaign_version(
+        self,
+        db: AsyncSession,
+        campaign_id: int,
+        version_id: int,
+        project_id: int,
+        user: User,
+    ) -> Campaign:
+        """
+        Dissocie un projet d'une version de campagne et retire les formulaires hérités de ce projet.
+        RÈGLE MÉTIER ABSOLUE :
+        Interdiction formelle de dissocier un projet d'une campagne publiée ou ouverte ('published', 'active', 'open').
+        Seules les versions en brouillon ('draft') d'une campagne non encore ouverte aux opérations peuvent être modifiées.
+        """
+        campaign = await self.get_campaign_by_id(db, campaign_id, user)
+        ver = await self.get_campaign_version(db, campaign_id, version_id, user)
+
+        # RÈGLE MÉTIER STRICTE : Seules les versions en brouillon ('draft') peuvent être modifiées
+        if ver.status != CampaignVersionStatus.DRAFT.value:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Action interdite : La version « v{ver.version_number} » de la campagne « {campaign.name} » est déjà scellée ({ver.status}). Impossible de dissocier un projet d'une version scellée afin de préserver l'intégrité et la traçabilité des collectes de données. Créez une nouvelle version en brouillon pour ajuster le périmètre."
+            )
+
+        current_projects = list(ver.target_projects or [])
+        filtered_projects = [
+            p for p in current_projects
+            if not ((p.get("id") == project_id or p.get("project_id") == project_id) if isinstance(p, dict) else p == project_id)
+        ]
+        ver.target_projects = filtered_projects
+        flag_modified(ver, "target_projects")
+
+        # Retirer les formulaires qui étaient sourcés uniquement par ce projet
+        current_forms = list(ver.target_forms or [])
+        filtered_forms = [
+            f for f in current_forms
+            if not (isinstance(f, dict) and f.get("source_project_id") == project_id)
+        ]
+        ver.target_forms = filtered_forms
+        flag_modified(ver, "target_forms")
+
+        await db.commit()
+        await db.refresh(ver)
+        await db.refresh(campaign)
+        self._populate_latest_version_attributes(campaign)
+        return campaign
+
+    async def attach_form_to_campaign_version(
+        self,
+        db: AsyncSession,
+        campaign_id: int,
+        version_id: int,
+        form_id: int,
+        user: User,
+        form_version_id: Optional[int] = None,
+    ) -> Campaign:
+        """
+        Associe un formulaire dans sa totalité à une version de campagne.
+        Toutes les versions du formulaire sont liées à cette version de campagne.
+        """
+        campaign = await self.get_campaign_by_id(db, campaign_id, user)
+        ver = await self.get_campaign_version(db, campaign_id, version_id, user)
+
+        # RÈGLE MÉTIER : Interdiction de modifier une version scellée/publiée
+        if ver.status != CampaignVersionStatus.DRAFT.value:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Modification non autorisée : La version « v{ver.version_number} » de la campagne est déjà {ver.status}. Seules les versions en brouillon peuvent être configurées. Une fois publiée, le périmètre d'une version est scellé."
+            )
+
+        form_stmt = select(Form).options(selectinload(Form.versions)).where(Form.id == form_id)
+        form_obj = (await db.execute(form_stmt)).scalars().first()
+        if not form_obj:
+            raise HTTPException(status_code=404, detail=f"Formulaire #{form_id} introuvable.")
+
+        # RÈGLE MÉTIER : Exclusion stricte des formulaires en brouillon
+        has_published_form_version = any(
+            v.status in ("published", "active", "archived") for v in (form_obj.versions or [])
+        ) or form_obj.status in ("published", "active")
+        if not has_published_form_version:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Action non autorisée : Le formulaire « {form_obj.name} » est encore en brouillon. Seuls les formulaires publiés peuvent être associés à une version de campagne."
+            )
+
+        # Résoudre la version du formulaire
+        target_v = None
+        if form_version_id and form_obj.versions:
+            target_v = next((v for v in form_obj.versions if v.id == form_version_id), None)
+        if not target_v and form_obj.versions:
+            pub_vers = [v for v in form_obj.versions if v.status in ("published", "active", "archived")]
+            if pub_vers:
+                target_v = pub_vers[0]
+
+        ver_num = target_v.version_number if target_v else (form_obj.version or "1.0.0")
+        ver_id = target_v.id if target_v else None
+
+        current_forms = list(ver.target_forms or [])
+        already_attached = any(
+            (f.get("id") == form_obj.id or f.get("form_id") == form_obj.id) if isinstance(f, dict) else f == form_obj.id
+            for f in current_forms
+        )
+
+        if not already_attached:
+            current_forms.append({
+                "id": form_obj.id,
+                "form_id": form_obj.id,
+                "name": form_obj.name,
+                "code": form_obj.code,
+                "version_number": ver_num,
+                "form_version_id": ver_id,
+                "attached_at": datetime.now(timezone.utc).isoformat(),
+            })
+            ver.target_forms = current_forms
+            flag_modified(ver, "target_forms")
+        else:
+            # Mettre à jour version_number si manquant
+            for cf in current_forms:
+                if isinstance(cf, dict) and (cf.get("id") == form_obj.id or cf.get("form_id") == form_obj.id):
+                    cf["version_number"] = ver_num
+                    if ver_id:
+                        cf["form_version_id"] = ver_id
+            ver.target_forms = current_forms
+            flag_modified(ver, "target_forms")
+
+        await db.commit()
+        await db.refresh(ver)
+        await db.refresh(campaign)
+        self._populate_latest_version_attributes(campaign)
+        return campaign
+
+    async def detach_form_from_campaign_version(
+        self,
+        db: AsyncSession,
+        campaign_id: int,
+        version_id: int,
+        form_id: int,
+        user: User,
+    ) -> Campaign:
+        """
+        Dissocie un formulaire autonome d'une version de campagne.
+        RÈGLE MÉTIER ABSOLUE :
+        Interdiction formelle de dissocier un formulaire d'une campagne publiée ou ouverte ('published', 'active', 'open').
+        """
+        campaign = await self.get_campaign_by_id(db, campaign_id, user)
+        ver = await self.get_campaign_version(db, campaign_id, version_id, user)
+
+        # RÈGLE MÉTIER STRICTE : Seules les versions en brouillon ('draft') peuvent être modifiées
+        if ver.status != CampaignVersionStatus.DRAFT.value:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Action interdite : La version « v{ver.version_number} » de la campagne « {campaign.name} » est déjà scellée ({ver.status}). Impossible de dissocier un formulaire d'une version scellée afin de préserver l'intégrité et la traçabilité des collectes de données. Créez une nouvelle version en brouillon pour ajuster le périmètre."
+            )
+
+        current_forms = list(ver.target_forms or [])
+        filtered_forms = [
+            f for f in current_forms
+            if not ((f.get("id") == form_id or f.get("form_id") == form_id) if isinstance(f, dict) else f == form_id)
+        ]
+        ver.target_forms = filtered_forms
+        flag_modified(ver, "target_forms")
+
+        await db.commit()
+        await db.refresh(ver)
+        await db.refresh(campaign)
+        self._populate_latest_version_attributes(campaign)
+        return campaign
+
+    async def get_campaigns_for_project(
+        self,
+        db: AsyncSession,
+        project_id: int,
+        user: User,
+    ) -> List[Dict[str, Any]]:
+        """
+        Récupère toutes les campagnes et versions associées à un projet.
+        """
+        stmt = (
+            select(Campaign)
+            .options(selectinload(Campaign.versions))
+            .order_by(desc(Campaign.created_at))
+        )
+        res = await db.execute(stmt)
+        campaigns = res.scalars().all()
+
+        results = []
+        for camp in campaigns:
+            matching_versions = []
+            for v in (camp.versions or []):
+                for p in (v.target_projects or []):
+                    pid = p.get("id") or p.get("project_id") if isinstance(p, dict) else p
+                    if pid == project_id:
+                        matching_versions.append({
+                            "id": v.id,
+                            "version_number": v.version_number,
+                            "status": v.status,
+                            "start_date": v.start_date.isoformat() if v.start_date else None,
+                            "end_date": v.end_date.isoformat() if v.end_date else None,
+                        })
+                        break
+
+            if matching_versions:
+                results.append({
+                    "id": camp.id,
+                    "name": camp.name,
+                    "code": camp.code,
+                    "status": camp.status,
+                    "version": camp.version,
+                    "matching_versions": matching_versions,
+                })
+
+        return results
+
+    async def get_campaigns_for_form(
+        self,
+        db: AsyncSession,
+        form_id: int,
+        user: User,
+    ) -> List[Dict[str, Any]]:
+        """
+        Récupère toutes les campagnes et versions associées à un formulaire.
+        """
+        stmt = (
+            select(Campaign)
+            .options(selectinload(Campaign.versions))
+            .order_by(desc(Campaign.created_at))
+        )
+        res = await db.execute(stmt)
+        campaigns = res.scalars().all()
+
+        results = []
+        for camp in campaigns:
+            matching_versions = []
+            for v in (camp.versions or []):
+                for f in (v.target_forms or []):
+                    fid = f.get("id") or f.get("form_id") if isinstance(f, dict) else f
+                    if fid == form_id:
+                        matching_versions.append({
+                            "id": v.id,
+                            "version_number": v.version_number,
+                            "status": v.status,
+                            "start_date": v.start_date.isoformat() if v.start_date else None,
+                            "end_date": v.end_date.isoformat() if v.end_date else None,
+                            "source_project_id": f.get("source_project_id") if isinstance(f, dict) else None,
+                            "source_project_name": f.get("source_project_name") if isinstance(f, dict) else None,
+                        })
+                        break
+
+            if matching_versions:
+                results.append({
+                    "id": camp.id,
+                    "name": camp.name,
+                    "code": camp.code,
+                    "status": camp.status,
+                    "version": camp.version,
+                    "matching_versions": matching_versions,
+                })
+
+        return results
+
+    async def reset_campaign_version_scope(
+        self,
+        db: AsyncSession,
+        campaign_id: int,
+        version_id: int,
+        user: User,
+    ) -> Campaign:
+        """
+        Réinitialise complètement le périmètre opérationnel (retire tous les projets et formulaires)
+        d'une version de campagne spécifique.
+        Règle d'or : Seules les versions en brouillon ('draft') peuvent voir leur périmètre réinitialisé.
+        """
+        campaign = await self.get_campaign_by_id(db, campaign_id, user)
+        ver = await self.get_campaign_version(db, campaign_id, version_id, user)
+
+        if ver.status != CampaignVersionStatus.DRAFT.value:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Action interdite : Seules les versions en brouillon peuvent voir leur périmètre réinitialisé (Statut actuel : {ver.status})."
+            )
+
+        ver.target_projects = []
+        ver.target_forms = []
+        flag_modified(ver, "target_projects")
+        flag_modified(ver, "target_forms")
+
+        await db.commit()
+        await db.refresh(ver)
+        await db.refresh(campaign)
+        self._populate_latest_version_attributes(campaign)
+        return campaign
 
 
 campaign_service = CampaignService()
+

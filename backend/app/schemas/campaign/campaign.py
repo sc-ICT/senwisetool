@@ -3,45 +3,56 @@ from datetime import datetime, timezone
 from pydantic import BaseModel, Field, computed_field, ConfigDict, field_validator
 
 
-class CampaignBase(BaseModel):
-    name: str = Field(..., min_length=2, max_length=255, description="Nom officiel de la campagne")
-    code: str = Field(..., min_length=2, max_length=100, description="Slug identifiant unique au sein de l'organisation")
-    campaign_type: str = Field(default="harvest", description="Type de campagne (harvest, audit, survey, inspection, custom)")
-    description: Optional[str] = Field(None, description="Description générale et contexte opérationnel")
-    objectives: Optional[str] = Field(None, description="Objectifs qualitatifs ou stratégiques")
-    targets: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Cibles chiffrées (producteurs, parcelles, volumes, etc.)")
-    start_date: Optional[datetime] = Field(None, description="Date de lancement de la campagne")
-    end_date: Optional[datetime] = Field(None, description="Date de fin prévisionnelle")
-    budget: Optional[float] = Field(None, description="Budget alloué à la campagne")
-    currency: str = Field(default="XOF", description="Devise du budget (XOF, EUR, USD)")
-    target_forms: List[Any] = Field(default_factory=list, description="Formulaires rattachés à cette campagne")
-    target_projects: List[Any] = Field(default_factory=list, description="Projets types rattachés à cette campagne")
-    settings: Dict[str, Any] = Field(default_factory=dict, description="Surcharges de comportement et paramètres du plugin")
-    plugin_id: Optional[int] = Field(None, description="ID du plugin dont est issue cette campagne")
-    plugin_code: Optional[str] = Field(None, description="Code slug du plugin associé")
-    scope: str = Field(default="tenant", description="Portée de l'outil: tenant, plugin_shared, preconfigured")
-    is_shared: bool = Field(default=False, description="Indique si la campagne est partagée entre toutes les organisations du plugin")
-    is_immutable: bool = Field(default=False, description="Indique si la configuration de base de la campagne est immuable / verrouillée")
-    immutable_fields: List[str] = Field(default_factory=list, description="Liste des champs verrouillés contre toute modification")
-    parent_template_id: Optional[int] = Field(None, description="ID du template modèle ou de la campagne partagée d'origine")
+# =====================================================================
+# SCHÉMAS DE VERSION DE CAMPAGNE (CAMPAIGN VERSION)
+# =====================================================================
 
-    @field_validator("immutable_fields", "target_forms", "target_projects", mode="before")
+class CampaignVersionBase(BaseModel):
+    version_number: str = Field(..., description="Numéro sémantique de version (ex: '1.0.0', '1.1.0')")
+    status: str = Field(default="draft", description="Statut de la version: draft, open, active, paused, closed, archived")
+    description: Optional[str] = Field(None, description="Directives et description opérationnelle en Markdown enrichi")
+    objectives: Optional[str] = Field(None, description="Objectifs stratégiques")
+    targets: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Périodicité, cibles chiffrées, timeline et jalons")
+    start_date: Optional[datetime] = Field(None, description="Date de début de cette version")
+    end_date: Optional[datetime] = Field(None, description="Date de fin de cette version")
+    budget: Optional[float] = Field(None, description="Budget alloué à cette version")
+    currency: str = Field(default="XOF", description="Devise du budget")
+    target_forms: List[Any] = Field(default_factory=list, description="Formulaires rattachés à cette version")
+    target_projects: List[Any] = Field(default_factory=list, description="Projets types rattachés à cette version")
+    settings: Dict[str, Any] = Field(default_factory=dict, description="Paramètres spécifiques à cette itération")
+    template_governance: Dict[str, Any] = Field(default_factory=dict, description="Règles de gouvernance")
+    changelog: Optional[str] = Field(None, description="Notes d'évolution de la version")
+
+    @field_validator("target_forms", "target_projects", mode="before")
     @classmethod
-    def ensure_list_base(cls, v):
+    def ensure_list_version(cls, v):
         return v if v is not None else []
 
-    @field_validator("targets", "settings", mode="before")
+    @field_validator("targets", "settings", "template_governance", mode="before")
     @classmethod
-    def ensure_dict_base(cls, v):
+    def ensure_dict_version(cls, v):
         return v if v is not None else {}
 
 
-class CampaignCreate(CampaignBase):
-    pass
+class CampaignVersionCreate(BaseModel):
+    version_number: str = Field(..., description="Numéro de version (ex: '1.1.0')")
+    status: Optional[str] = Field("draft", description="Statut initial")
+    description: Optional[str] = None
+    objectives: Optional[str] = None
+    targets: Optional[Dict[str, Any]] = None
+    start_date: Optional[datetime] = None
+    end_date: Optional[datetime] = None
+    budget: Optional[float] = None
+    currency: Optional[str] = "XOF"
+    target_forms: Optional[List[Any]] = None
+    target_projects: Optional[List[Any]] = None
+    settings: Optional[Dict[str, Any]] = None
+    template_governance: Optional[Dict[str, Any]] = None
+    changelog: Optional[str] = None
 
 
-class CampaignUpdate(BaseModel):
-    name: Optional[str] = Field(None, min_length=2, max_length=255)
+class CampaignVersionUpdate(BaseModel):
+    status: Optional[str] = None
     description: Optional[str] = None
     objectives: Optional[str] = None
     targets: Optional[Dict[str, Any]] = None
@@ -52,32 +63,23 @@ class CampaignUpdate(BaseModel):
     target_forms: Optional[List[Any]] = None
     target_projects: Optional[List[Any]] = None
     settings: Optional[Dict[str, Any]] = None
-    scope: Optional[str] = None
-    is_shared: Optional[bool] = None
-    is_immutable: Optional[bool] = None
-    immutable_fields: Optional[List[str]] = None
+    template_governance: Optional[Dict[str, Any]] = None
+    changelog: Optional[str] = None
 
 
-class CampaignStatusUpdate(BaseModel):
-    status: str = Field(..., description="Nouveau statut : open, paused, closed, archived")
-    reason: Optional[str] = Field(None, description="Motif de changement de statut")
+class CampaignVersionCloneRequest(BaseModel):
+    source_version_id: Optional[int] = Field(None, description="ID de la version source à dupliquer (par défaut la version courante)")
+    new_version_number: str = Field(..., description="Nouveau numéro de version incrémentale (ex: '1.1.0')")
+    changelog: Optional[str] = Field(None, description="Notes de mise à jour pour cette nouvelle version")
+    copy_scope: Optional[bool] = Field(False, description="Conserver les projets et formulaires de la version source")
 
 
-class CampaignResponse(BaseModel):
+class CampaignVersionResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
-    organization_id: Optional[int] = None
-    plugin_id: Optional[int] = None
-    plugin_code: Optional[str] = None
-    scope: str = "tenant"
-    is_shared: bool = False
-    is_immutable: bool = False
-    immutable_fields: List[str] = Field(default_factory=list)
-    parent_template_id: Optional[int] = None
-    name: str
-    code: str
-    campaign_type: str
+    campaign_id: int
+    version_number: str
     status: str
     description: Optional[str] = None
     objectives: Optional[str] = None
@@ -89,6 +91,8 @@ class CampaignResponse(BaseModel):
     target_forms: List[Any] = Field(default_factory=list)
     target_projects: List[Any] = Field(default_factory=list)
     settings: Dict[str, Any] = Field(default_factory=dict)
+    template_governance: Dict[str, Any] = Field(default_factory=dict)
+    changelog: Optional[str] = None
     metrics: Dict[str, Any] = Field(default_factory=dict)
     created_by_id: Optional[int] = None
     closed_at: Optional[datetime] = None
@@ -96,55 +100,30 @@ class CampaignResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-    @field_validator("immutable_fields", "target_forms", "target_projects", mode="before")
+    @field_validator("target_forms", "target_projects", mode="before")
     @classmethod
-    def ensure_list_response(cls, v):
+    def ensure_list(cls, v):
         return v if v is not None else []
 
-    @field_validator("targets", "settings", "metrics", mode="before")
+    @field_validator("targets", "settings", "template_governance", "metrics", mode="before")
     @classmethod
-    def ensure_dict_response(cls, v):
+    def ensure_dict(cls, v):
         return v if v is not None else {}
 
     @computed_field
     @property
-    def organizationId(self) -> Optional[int]:
-        return self.organization_id
+    def versionNumber(self) -> str:
+        return self.version_number
 
     @computed_field
     @property
-    def isShared(self) -> bool:
-        return self.is_shared
+    def templateGovernance(self) -> Dict[str, Any]:
+        return self.template_governance or {}
 
     @computed_field
     @property
-    def isImmutable(self) -> bool:
-        return self.is_immutable
-
-    @computed_field
-    @property
-    def immutableFields(self) -> List[str]:
-        return self.immutable_fields or []
-
-    @computed_field
-    @property
-    def parentTemplateId(self) -> Optional[int]:
-        return self.parent_template_id
-
-    @computed_field
-    @property
-    def pluginId(self) -> Optional[int]:
-        return self.plugin_id
-
-    @computed_field
-    @property
-    def pluginCode(self) -> Optional[str]:
-        return self.plugin_code
-
-    @computed_field
-    @property
-    def campaignType(self) -> str:
-        return self.campaign_type
+    def campaignId(self) -> int:
+        return self.campaign_id
 
     @computed_field
     @property
@@ -191,27 +170,179 @@ class CampaignResponse(BaseModel):
     def updatedAt(self) -> datetime:
         return self.updated_at
 
+
+# =====================================================================
+# SCHÉMAS DE LA CAMPAGNE MAÎTRESSE (CAMPAIGN)
+# =====================================================================
+
+class CampaignBase(BaseModel):
+    name: str = Field(..., min_length=2, max_length=255, description="Nom officiel de la campagne")
+    code: str = Field(..., min_length=2, max_length=100, description="Slug identifiant unique globalement")
+    description: Optional[str] = Field(None, description="Description générale et directives en Markdown")
+    visibility: str = Field(default="public", description="Visibilité: public ou private")
+    initial_version: Optional[str] = Field("1.0.0", description="Version sémantique initiale")
+    start_date: Optional[datetime] = Field(None, description="Date de lancement de la version initiale")
+    end_date: Optional[datetime] = Field(None, description="Date de fin prévisionnelle")
+    settings: Dict[str, Any] = Field(default_factory=dict, description="Paramètres opérationnels")
+
+    @field_validator("settings", mode="before")
+    @classmethod
+    def ensure_dict_base(cls, v):
+        return v if v is not None else {}
+
+
+class CampaignCreate(CampaignBase):
+    pass
+
+
+class CampaignUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=2, max_length=255)
+    code: Optional[str] = Field(None, min_length=2, max_length=100)
+    description: Optional[str] = None
+    visibility: Optional[str] = None
+    version: Optional[str] = None
+    settings: Optional[Dict[str, Any]] = None
+
+
+class CampaignStatusUpdate(BaseModel):
+    status: str = Field(..., description="Nouveau statut : open, paused, closed, archived")
+    reason: Optional[str] = Field(None, description="Motif de changement de statut")
+
+
+class CampaignResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    code: str
+    description: Optional[str] = None
+    visibility: str = "public"
+    status: str
+    version: str = "1.0.0"
+
+    settings: Dict[str, Any] = Field(default_factory=dict)
+    created_by_id: Optional[int] = None
+    closed_at: Optional[datetime] = None
+    closed_by_id: Optional[int] = None
+    created_at: datetime
+    updated_at: datetime
+
+    versions: List[CampaignVersionResponse] = Field(default_factory=list)
+
+    @field_validator("settings", mode="before")
+    @classmethod
+    def ensure_dict_response(cls, v):
+        return v if v is not None else {}
+
+    @computed_field
+    @property
+    def organizationId(self) -> Optional[int]:
+        return None
+
+    @computed_field
+    @property
+    def pluginId(self) -> Optional[int]:
+        return None
+
+    @computed_field
+    @property
+    def pluginCode(self) -> Optional[str]:
+        return None
+
+    @computed_field
+    @property
+    def isShared(self) -> bool:
+        return False
+
+    @computed_field
+    @property
+    def isImmutable(self) -> bool:
+        return False
+
+    @computed_field
+    @property
+    def immutableFields(self) -> List[str]:
+        return []
+
+    @computed_field
+    @property
+    def parentTemplateId(self) -> Optional[int]:
+        return None
+
+    @computed_field
+    @property
+    def campaignType(self) -> str:
+        return "campaign"
+
+    @computed_field
+    @property
+    def createdById(self) -> Optional[int]:
+        return self.created_by_id
+
+    @computed_field
+    @property
+    def closedAt(self) -> Optional[datetime]:
+        return self.closed_at
+
+    @computed_field
+    @property
+    def closedById(self) -> Optional[int]:
+        return self.closed_by_id
+
+    @computed_field
+    @property
+    def createdAt(self) -> datetime:
+        return self.created_at
+
+    @computed_field
+    @property
+    def updatedAt(self) -> datetime:
+        return self.updated_at
+
+    @computed_field
+    @property
+    def startDate(self) -> Optional[datetime]:
+        if self.versions:
+            active_v = next(
+                (v for v in self.versions if v.status in ["open", "active"]),
+                self.versions[0]
+            )
+            return active_v.start_date
+        return None
+
+    @computed_field
+    @property
+    def endDate(self) -> Optional[datetime]:
+        if self.versions:
+            active_v = next(
+                (v for v in self.versions if v.status in ["open", "active"]),
+                self.versions[0]
+            )
+            return active_v.end_date
+        return None
+
     @computed_field
     @property
     def daysRemaining(self) -> Optional[int]:
-        if not self.end_date:
+        end_d = self.endDate
+        if not end_d:
             return None
         now = datetime.now(timezone.utc)
-        end = self.end_date if self.end_date.tzinfo else self.end_date.replace(tzinfo=timezone.utc)
+        end = end_d if end_d.tzinfo else end_d.replace(tzinfo=timezone.utc)
         diff = (end - now).total_seconds()
         return max(0, int(diff // 86400))
 
     @computed_field
     @property
     def progressPercentage(self) -> int:
-        if self.metrics and "progress_percentage" in self.metrics:
-            return int(self.metrics["progress_percentage"])
         if self.status == "closed" or self.status == "archived":
             return 100
-        if self.start_date and self.end_date:
+        start_d = self.startDate
+        end_d = self.endDate
+        if start_d and end_d:
             now = datetime.now(timezone.utc)
-            start = self.start_date if self.start_date.tzinfo else self.start_date.replace(tzinfo=timezone.utc)
-            end = self.end_date if self.end_date.tzinfo else self.end_date.replace(tzinfo=timezone.utc)
+            start = start_d if start_d.tzinfo else start_d.replace(tzinfo=timezone.utc)
+            end = end_d if end_d.tzinfo else end_d.replace(tzinfo=timezone.utc)
             total = (end - start).total_seconds()
             if total > 0:
                 elapsed = (now - start).total_seconds()

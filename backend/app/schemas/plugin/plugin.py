@@ -1,6 +1,6 @@
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timezone
-from pydantic import BaseModel, ConfigDict, Field, computed_field
+from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 from app.models.plugin.plugin import PluginStatus, PluginVersionStatus, OrgPluginStatus
 
 
@@ -8,15 +8,140 @@ from app.models.plugin.plugin import PluginStatus, PluginVersionStatus, OrgPlugi
 # PLUGIN VERSION SCHEMAS
 # ==========================================
 
+# ==========================================
+# PLUGIN VERSION TOOLS (MODULES & FEATURES)
+# ==========================================
+
+class PluginVersionToolBase(BaseModel):
+    item_key: str = Field(..., description="Clé unique de l'élément dans la version (ex: projects_12, tool_projects)")
+    tool_code: str = Field(..., description="Code du module ou outil (projects, forms, resources, campaigns)")
+    type: str = Field(default="module", description="feature ou module")
+    config_target: str = Field(default="tool_resource", description="tool_global ou tool_resource")
+    name: str = Field(..., description="Nom d'affichage du composant")
+    description: Optional[str] = Field(None, description="Description enrichie (Markdown)")
+    selected_resource_id: Optional[int] = None
+    selected_resource_code: Optional[str] = None
+    selected_resource_name: Optional[str] = None
+    selected_resource_status: Optional[str] = None
+    distribution_mode: str = Field(default="tenant", description="tenant, universal, plugin_shared, preconfigured")
+    permissions_mode: str = Field(default="restricted", description="restricted ou shared")
+    parameters: Dict[str, Any] = Field(default_factory=dict, description="Paramètres et options spécifiques du module")
+
+
+class PluginVersionToolCreate(PluginVersionToolBase):
+    pass
+
+
+class PluginVersionToolUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    distribution_mode: Optional[str] = None
+    permissions_mode: Optional[str] = None
+    parameters: Optional[Dict[str, Any]] = None
+
+
+class PluginVersionToolResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
+
+    id: Optional[int] = None
+    plugin_version_id: Optional[int] = None
+    item_key: Optional[str] = ""
+    tool_code: Optional[str] = None
+    code: Optional[str] = None
+    type: Optional[str] = "module"
+    config_target: Optional[str] = "tool_resource"
+    name: Optional[str] = ""
+    description: Optional[str] = None
+    selected_resource_id: Optional[int] = None
+    selected_resource_code: Optional[str] = None
+    selected_resource_name: Optional[str] = None
+    selected_resource_status: Optional[str] = None
+    distribution_mode: Optional[str] = "tenant"
+    permissions_mode: Optional[str] = "restricted"
+    parameters: Optional[Dict[str, Any]] = Field(default_factory=dict)
+    settings: Optional[Dict[str, Any]] = Field(default_factory=dict)
+    declaration: Optional[Dict[str, Any]] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def harmonize_tool_fields(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            if not data.get("tool_code") and data.get("code"):
+                data["tool_code"] = data["code"]
+            if not data.get("code") and data.get("tool_code"):
+                data["code"] = data["tool_code"]
+            if not data.get("name") and data.get("title"):
+                data["name"] = data["title"]
+            if not data.get("item_key") and data.get("id"):
+                data["item_key"] = str(data["id"])
+            if not data.get("item_key") and data.get("tool_code"):
+                data["item_key"] = f"tool_{data['tool_code']}"
+        return data
+
+    @computed_field
+    @property
+    def itemKey(self) -> str:
+        return self.item_key or ""
+
+    @computed_field
+    @property
+    def toolCode(self) -> str:
+        return self.tool_code or self.code or ""
+
+    @computed_field
+    @property
+    def configTarget(self) -> str:
+        return self.config_target or "tool_resource"
+
+    @computed_field
+    @property
+    def pluginVersionId(self) -> Optional[int]:
+        return self.plugin_version_id
+
+    @computed_field
+    @property
+    def selectedResourceId(self) -> Optional[int]:
+        return self.selected_resource_id
+
+    @computed_field
+    @property
+    def selectedResourceCode(self) -> Optional[str]:
+        return self.selected_resource_code
+
+    @computed_field
+    @property
+    def selectedResourceName(self) -> Optional[str]:
+        return self.selected_resource_name
+
+    @computed_field
+    @property
+    def selectedResourceStatus(self) -> Optional[str]:
+        return self.selected_resource_status
+
+    @computed_field
+    @property
+    def distributionMode(self) -> str:
+        return self.distribution_mode or "tenant"
+
+    @computed_field
+    @property
+    def permissionsMode(self) -> str:
+        return self.permissions_mode or "restricted"
+
+
 class PluginVersionBase(BaseModel):
     version_number: str = Field(..., description="Numéro de version SemVer, ex: 1.0.0")
     changelog: Optional[str] = Field(None, description="Notes de version / changelog Markdown")
-    package_data: Dict[str, Any] = Field(default_factory=dict, description="Projets, formulaires, télémétrie")
-    usage_policy: str = Field(..., description="Politique d'utilisation obligatoire (EULA)")
+    package_data: Optional[Dict[str, Any]] = Field(default=None, description="Projets, formulaires, télémétrie")
+    usage_policy: Optional[str] = Field(default=None, description="Politique d'utilisation obligatoire (EULA)")
+    source_version_id: Optional[int] = Field(None, description="ID de la version source à partir de laquelle hériter tous les modules et configurations")
 
 
 class PluginVersionCreate(PluginVersionBase):
     pass
+
 
 
 class PluginVersionUpdate(BaseModel):
@@ -32,9 +157,10 @@ class PluginVersionResponse(BaseModel):
     plugin_id: int
     version_number: str
     changelog: Optional[str] = None
-    package_data: Dict[str, Any] = Field(default_factory=dict)
-    usage_policy: str
+    package_data: Optional[Dict[str, Any]] = Field(default_factory=dict)
+    usage_policy: Optional[str] = None
     status: str
+    tools: List[PluginVersionToolResponse] = Field(default_factory=list)
     published_by_id: Optional[int] = None
     published_at: Optional[datetime] = None
     deprecated_at: Optional[datetime] = None
@@ -58,12 +184,12 @@ class PluginVersionResponse(BaseModel):
     @computed_field
     @property
     def packageData(self) -> Dict[str, Any]:
-        return self.package_data
+        return self.package_data or {}
 
     @computed_field
     @property
     def usagePolicy(self) -> str:
-        return self.usage_policy
+        return self.usage_policy or ""
 
     @computed_field
     @property
@@ -146,7 +272,6 @@ class PluginVersionDeprecate(BaseModel):
     custom_eol_date: Optional[datetime] = None
 
 
-
 # ==========================================
 # PLUGIN SCHEMAS
 # ==========================================
@@ -161,6 +286,8 @@ class PluginBase(BaseModel):
     banner_url: Optional[str] = None
     author: str = Field(default="SenWiseTool")
     tags: List[str] = Field(default_factory=list)
+    is_public: bool = Field(default=True, description="True si public à tous, False si restreint à des organisations")
+    allowed_organization_ids: List[int] = Field(default_factory=list, description="IDs des organisations autorisées si privé")
 
 
 class PluginCreate(PluginBase):
@@ -181,6 +308,8 @@ class PluginUpdate(BaseModel):
     author: Optional[str] = None
     tags: Optional[List[str]] = None
     status: Optional[str] = None
+    is_public: Optional[bool] = None
+    allowed_organization_ids: Optional[List[int]] = None
 
 
 class PluginResponse(BaseModel):
@@ -197,6 +326,9 @@ class PluginResponse(BaseModel):
     author: str
     status: str
     tags: List[str] = Field(default_factory=list)
+    is_public: bool = True
+    allowed_organization_ids: List[int] = Field(default_factory=list)
+    allowed_organizations: Optional[List[Dict[str, Any]]] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
 
@@ -209,6 +341,21 @@ class PluginResponse(BaseModel):
     oldest_published_version_id: Optional[int] = None
     versions_count: int = 0
     installations_count: int = 0
+
+    @computed_field
+    @property
+    def isPublic(self) -> bool:
+        return self.is_public
+
+    @computed_field
+    @property
+    def allowedOrganizationIds(self) -> List[int]:
+        return self.allowed_organization_ids or []
+
+    @computed_field
+    @property
+    def allowedOrganizations(self) -> List[Dict[str, Any]]:
+        return self.allowed_organizations or []
 
     @computed_field
     @property
@@ -306,6 +453,25 @@ class PluginUninstallRequest(BaseModel):
     reason: Optional[str] = None
 
 
+class PluginVersionSwitchRequest(BaseModel):
+    plugin_id: int
+    version_id: int
+
+
+class OrganizationPluginDownloadedVersionResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
+
+    id: int
+    organization_plugin_id: int
+    plugin_id: int
+    plugin_version_id: int
+    version_number: str
+    status: str
+    changelog: Optional[str] = None
+    parameters: Optional[Dict[str, Any]] = None
+    created_at: Optional[datetime] = None
+
+
 class OrganizationPluginResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True, populate_by_name=True)
 
@@ -313,6 +479,14 @@ class OrganizationPluginResponse(BaseModel):
     organization_id: int
     plugin_id: int
     installed_version_id: int
+    code: Optional[str] = None
+    name: Optional[str] = None
+    category: Optional[str] = None
+    description: Optional[str] = None
+    short_description: Optional[str] = None
+    icon_url: Optional[str] = None
+    banner_url: Optional[str] = None
+    author: Optional[str] = "SenWiseTool"
     status: str
     policy_accepted_at: datetime
     policy_accepted_by_user_id: Optional[int] = None
@@ -324,7 +498,13 @@ class OrganizationPluginResponse(BaseModel):
     plugin: Optional[PluginResponse] = None
     installed_version: Optional[PluginVersionResponse] = None
     latest_version: Optional[PluginVersionResponse] = None
+    downloaded_versions: List[OrganizationPluginDownloadedVersionResponse] = Field(default_factory=list)
     has_update_available: bool = False
+
+    @computed_field
+    @property
+    def downloadedVersions(self) -> List[OrganizationPluginDownloadedVersionResponse]:
+        return self.downloaded_versions
 
     @computed_field
     @property
@@ -427,3 +607,126 @@ class MarketplaceCatalogResponse(BaseModel):
     items: List[MarketplacePluginItem]
     categories: List[str]
     total: int
+
+
+class PluginInstallModuleRequest(BaseModel):
+    tool_code: Optional[str] = None
+    item_key: Optional[str] = None
+    ref_table: Optional[str] = None
+    ref_id: Optional[int] = None
+
+
+# ==========================================
+# DOWNLOADED ELEMENTS SCHEMAS (TENANT WORKSPACE)
+# ==========================================
+
+class OrganizationPluginVersionResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
+
+    id: int
+    organization_id: int
+    organization_plugin_id: int
+    plugin_id: int
+    plugin_version_id: int
+    version_number: str
+    status: str
+    changelog: Optional[str] = None
+    usage_policy: Optional[str] = None
+    policy_accepted_at: datetime
+    policy_version: str
+    package_snapshot: Optional[Dict[str, Any]] = None
+    parameters: Optional[Dict[str, Any]] = None
+    installed_at: datetime
+    updated_at: datetime
+
+
+class OrganizationProjectResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
+
+    id: int
+    organization_id: int
+    original_project_id: Optional[int] = None
+    organization_plugin_id: Optional[int] = None
+    name: str
+    code: str
+    project_type: str = "audit"
+    category: str = "general"
+    visibility: str = "private"
+    authorized_organization_ids: List[int] = Field(default_factory=list)
+    cover_image_url: Optional[str] = None
+    parameters: Dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+    updated_at: datetime
+
+
+class OrganizationFeatureResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
+
+    id: int
+    organization_id: int
+    name: str
+    feature_code: str
+    description: Optional[str] = None
+    parameters: Dict[str, Any] = Field(default_factory=dict)
+    permissions: Dict[str, Any] = Field(default_factory=dict)
+    status: str = "active"
+    organization_plugin_id: Optional[int] = None
+    organization_plugin_version_id: Optional[int] = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class OrganizationProjectModuleResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
+
+    id: int
+    organization_id: int
+    organization_plugin_id: int = 0
+    organization_plugin_version_id: int = 0
+    original_plugin_version_tool_id: Optional[int] = None
+    original_project_id: Optional[int] = None
+    original_project_version_id: Optional[int] = None
+    cloned_project_id: Optional[int] = None
+    item_key: str = ""
+    name: str
+    code: str
+    description: Optional[str] = None
+    version_number: Optional[str] = None
+    distribution_mode: str = "tenant"
+    permissions_mode: str = "restricted"
+    parameters: Dict[str, Any] = Field(default_factory=dict)
+    status: str = "active"
+    created_at: datetime
+    updated_at: datetime
+
+
+class OrganizationProjectModuleUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    parameters: Optional[Dict[str, Any]] = None
+    status: Optional[str] = None
+
+
+class OrganizationProjectFeatureResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
+
+    id: int
+    organization_id: int
+    organization_plugin_id: int
+    organization_plugin_version_id: int
+    original_plugin_version_tool_id: Optional[int] = None
+    item_key: str
+    feature_code: str = "projects"
+    name: str
+    description: Optional[str] = None
+    distribution_mode: str = "tenant"
+    permissions_mode: str = "restricted"
+    parameters: Dict[str, Any] = Field(default_factory=dict)
+    status: str = "active"
+    created_at: datetime
+    updated_at: datetime
+
+
+class OrganizationProjectFeatureUpdate(BaseModel):
+    parameters: Optional[Dict[str, Any]] = None
+    status: Optional[str] = None

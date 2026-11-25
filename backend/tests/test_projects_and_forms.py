@@ -1,7 +1,7 @@
 import pytest
-from app.services.project.condition_evaluator import UniversalConditionEvaluator
-from app.services.project.formula_engine import FormulaEngine
-from app.services.project.compliance_scorer import ComplianceScorer
+from app.services.form.condition_evaluator import UniversalConditionEvaluator
+from app.services.form.formula_engine import FormulaEngine
+from app.services.form.compliance_scorer import ComplianceScorer
 
 
 def test_question_to_question_dependency():

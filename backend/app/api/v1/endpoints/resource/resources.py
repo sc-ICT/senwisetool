@@ -11,6 +11,9 @@ from app.schemas.resource.resource import (
     ResourceResponse,
     ResourceListResponse,
     ResourceFieldSchema,
+    ResourceVersionCloneRequest,
+    ResourceVersionUpdate,
+    ResourceVersionResponse,
     SchemaReconciliationReport,
     SchemaApplyPayload,
     ResourceItemCreate,
@@ -18,6 +21,7 @@ from app.schemas.resource.resource import (
     ResourceItemResponse,
     ResourceItemListResponse,
     ResourceBulkImportPayload,
+    ResourceBulkDeletePayload,
     ResourceCreateNewVersion,
     DataImportReport,
 )
@@ -73,6 +77,7 @@ async def reconcile_resource_schema(
         incoming_fields=raw_fields,
         user=current_user,
         apply_changes=not payload.dry_run,
+        unique_population_strategies=payload.unique_population_strategies,
     )
     return report
 
@@ -141,6 +146,23 @@ async def get_resource(
     return resource
 
 
+@router.get("/{resource_id}/governance", summary="Obtenir les permissions et la gouvernance d'une ressource")
+async def get_resource_governance(
+    resource_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Retourne les permissions résolues selon la préséance (Module > Fonctionnalité > Défaut)
+    ainsi que les liaisons campagne et les champs immuables.
+    """
+    return await resource_service.get_resource_governance(
+        db=db,
+        resource_id=resource_id,
+        user=current_user,
+    )
+
+
 @router.put("/{resource_id}", response_model=ResourceResponse, summary="Mettre à jour une ressource")
 async def update_resource(
     resource_id: int,
@@ -177,6 +199,85 @@ async def delete_resource(
 
 
 # ---------------------------------------------------------------------------
+# GESTION DES VERSIONS DE LA RESSOURCE (VERSIONING PATTERN)
+# ---------------------------------------------------------------------------
+
+
+@router.post("/{resource_id}/versions/clone", response_model=ResourceResponse, status_code=status.HTTP_201_CREATED, summary="Cloner une version existante pour créer une nouvelle version")
+async def clone_resource_version(
+    resource_id: int,
+    payload: ResourceVersionCloneRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Clone une version existante pour générer une nouvelle version incrémentale en brouillon.
+    """
+    return await resource_service.clone_resource_version(
+        db=db,
+        resource_id=resource_id,
+        req=payload,
+        user=current_user,
+    )
+
+
+@router.post("/{resource_id}/versions/{version_id}/publish", response_model=ResourceResponse, summary="Publier une version spécifique d'une ressource")
+async def publish_resource_version(
+    resource_id: int,
+    version_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Publie et scelle une version spécifique d'une ressource.
+    """
+    return await resource_service.publish_resource_version(
+        db=db,
+        resource_id=resource_id,
+        version_id=version_id,
+        user=current_user,
+    )
+
+
+@router.put("/{resource_id}/versions/{version_id}", response_model=ResourceResponse, summary="Mettre à jour une version spécifique d'une ressource")
+async def update_resource_version(
+    resource_id: int,
+    version_id: int,
+    payload: ResourceVersionUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Met à jour la description, changelog, paramètres ou schéma d'une version en brouillon.
+    """
+    return await resource_service.update_resource_version(
+        db=db,
+        resource_id=resource_id,
+        version_id=version_id,
+        data=payload,
+        user=current_user,
+    )
+
+
+@router.delete("/{resource_id}/versions/{version_id}", summary="Supprimer une version d'une ressource")
+async def delete_resource_version(
+    resource_id: int,
+    version_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Supprime une version spécifique. Si c'est l'unique version, supprime la ressource.
+    """
+    return await resource_service.delete_resource_version(
+        db=db,
+        resource_id=resource_id,
+        version_id=version_id,
+        user=current_user,
+    )
+
+
+# ---------------------------------------------------------------------------
 # ITEMS / ENREGISTREMENTS DYNAMIQUES
 # ---------------------------------------------------------------------------
 
@@ -184,6 +285,7 @@ async def delete_resource(
 @router.get("/{resource_id}/items", response_model=ResourceItemListResponse, summary="Lister les données d'une ressource")
 async def list_resource_items(
     resource_id: int,
+    version_id: Optional[int] = Query(None, description="ID de la version spécifique de la ressource"),
     search: Optional[str] = Query(None, description="Recherche textuelle dans les données"),
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=5000),
@@ -191,12 +293,13 @@ async def list_resource_items(
     current_user: User = Depends(get_current_user),
 ):
     """
-    Retourne la liste paginée des enregistrements de données d'une ressource.
+    Retourne la liste paginée des enregistrements de données d'une ressource (filtrés par version si spécifié).
     """
     result = await resource_service.list_items(
         db=db,
         resource_id=resource_id,
         user=current_user,
+        version_id=version_id,
         search=search,
         skip=skip,
         limit=limit,
@@ -208,17 +311,19 @@ async def list_resource_items(
 async def create_resource_item(
     resource_id: int,
     payload: ResourceItemCreate,
+    version_id: Optional[int] = Query(None, description="ID de la version cible"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """
-    Ajoute un enregistrement dynamique conforme au schéma défini sur la ressource.
+    Ajoute un enregistrement dynamique conforme au schéma défini sur la version de la ressource.
     """
     item = await resource_service.create_item(
         db=db,
         resource_id=resource_id,
         payload=payload,
         user=current_user,
+        version_id=version_id,
     )
     return item
 
@@ -227,18 +332,19 @@ async def create_resource_item(
 async def bulk_import_resource_items(
     resource_id: int,
     payload: ResourceBulkImportPayload,
+    version_id: Optional[int] = Query(None, description="ID de la version cible"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """
-    Pré-charge des enregistrements de données dans la ressource en masse.
-    Idéal pour le Super Admin configurant un jeu de données initial.
+    Pré-charge des enregistrements de données dans la ressource en masse pour la version ciblée.
     """
     result = await resource_service.bulk_import_items(
         db=db,
         resource_id=resource_id,
         payload=payload,
         user=current_user,
+        version_id=version_id,
     )
     return result
 
@@ -248,6 +354,7 @@ async def update_resource_item(
     resource_id: int,
     item_id: int,
     payload: ResourceItemUpdate,
+    version_id: Optional[int] = Query(None, description="Version ciblée de la ressource"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -260,6 +367,7 @@ async def update_resource_item(
         item_id=item_id,
         payload=payload,
         user=current_user,
+        version_id=version_id,
     )
     return item
 
@@ -278,6 +386,24 @@ async def delete_resource_item(
         db=db,
         resource_id=resource_id,
         item_id=item_id,
+        user=current_user,
+    )
+
+
+@router.post("/{resource_id}/items/bulk-delete", summary="Supprimer plusieurs enregistrements")
+async def bulk_delete_resource_items(
+    resource_id: int,
+    payload: ResourceBulkDeletePayload,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Supprime plusieurs enregistrements sélectionnés d'une ressource en une seule transaction.
+    """
+    return await resource_service.bulk_delete_items(
+        db=db,
+        resource_id=resource_id,
+        item_ids=payload.item_ids,
         user=current_user,
     )
 
@@ -305,6 +431,7 @@ async def get_related_items(
 async def get_relation_options(
     resource_id: int,
     display_field: Optional[str] = Query(None, description="Champ de référence pour le libellé"),
+    target_version_id: Optional[int] = Query(None, description="Identifiant optionnel de la version spécifique de la ressource cible"),
     search: Optional[str] = Query(None, description="Recherche dans les données"),
     limit: int = Query(100, ge=1, le=500),
     db: AsyncSession = Depends(get_db),
@@ -318,6 +445,7 @@ async def get_relation_options(
         db=db,
         resource_id=resource_id,
         user=current_user,
+        target_version_id=target_version_id,
         display_field=display_field,
         search=search,
         limit=limit,
@@ -365,13 +493,14 @@ async def toggle_resource_lts(
 @router.get("/{resource_id}/data/template", summary="Télécharger le modèle Excel de données pour cette ressource")
 async def download_resource_data_template(
     resource_id: int,
+    version_id: Optional[int] = Query(None, description="Identifiant optionnel de la version pour cibler ses champs spécifiques"),
     db: AsyncSession = Depends(get_db),
 ):
     """
     Génère et télécharge le fichier Excel modèle spécifiquement structuré avec les colonnes
-    et contraintes de la ressource ciblée.
+    et contraintes de la ressource ou de la version ciblée.
     """
-    excel_bytes = await resource_service.get_resource_data_template(db, resource_id, None)
+    excel_bytes = await resource_service.get_resource_data_template(db, resource_id, None, version_id=version_id)
     return Response(
         content=excel_bytes,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -385,6 +514,7 @@ async def validate_and_import_resource_data(
     file: UploadFile = File(...),
     update_existing: bool = Query(True, description="Mettre à jour les enregistrements existants si la clé correspond (Upsert)"),
     dry_run: bool = Query(True, description="Si True, analyse sans modifier la base de données"),
+    version_id: Optional[int] = Query(None, description="Identifiant optionnel de la version ciblée pour l'import"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -401,6 +531,7 @@ async def validate_and_import_resource_data(
         update_existing=update_existing,
         dry_run=dry_run,
         user=current_user,
+        version_id=version_id,
     )
     return report
 
@@ -434,6 +565,7 @@ async def upload_resource_media(
 @router.get("/{resource_id}/export/data", summary="Exporter les données d'une ressource (Excel, CSV, JSON, ZIP)")
 async def export_resource_data(
     resource_id: int,
+    version_id: Optional[int] = Query(None, description="ID de la version spécifique"),
     format: str = Query("xlsx", description="Format d'export : xlsx, csv ou json"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -449,6 +581,7 @@ async def export_resource_data(
         resource_id=resource_id,
         format=format,
         user=current_user,
+        version_id=version_id,
     )
     return Response(
         content=file_bytes,

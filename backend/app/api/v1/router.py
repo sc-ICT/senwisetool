@@ -5,7 +5,8 @@ from app.api.v1.endpoints.notification.notifications import router as notificati
 from app.api.v1.endpoints.plugin import plugins_router, marketplace_router
 from app.api.v1.endpoints.campaign import campaigns_router
 from app.api.v1.endpoints.resource import resources_router
-from app.api.v1.endpoints.project import projects_router, forms_router
+from app.api.v1.endpoints.project import projects_router
+from app.api.v1.endpoints.form import forms_router
 
 api_router = APIRouter()
 api_router.include_router(auth.router, prefix="/auth", tags=["auth"])
