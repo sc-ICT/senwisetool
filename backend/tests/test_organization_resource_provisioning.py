@@ -7,13 +7,15 @@ from sqlalchemy import select, func
 
 from app.db.database import Base, engine, SessionLocal
 from app.models.organization.organization import Organization
+from app.models.organization.organization_plugin import (
+    OrganizationPlugin,
+    OrganizationPluginVersion,
+)
 from app.models.user.user import User, UserRole, UserStatus
 from app.models.plugin.plugin import (
     Plugin,
     PluginVersion,
     PluginVersionTool,
-    OrganizationPlugin,
-    OrganizationPluginVersion,
     PluginStatus,
     PluginVersionStatus,
     OrgPluginStatus,
@@ -184,15 +186,17 @@ async def test_organization_resource_download_and_provisioning():
         # 7. Vérifications strictes :
         # A. OrganizationPlugin
         assert inst is not None
-        assert inst.organization_id == org.id
-        assert inst.installed_version_id == pv.id
-        assert inst.status == OrgPluginStatus.INSTALLED.value
+        assert inst["organization_id"] == org.id
+        assert inst["installed_version"]["version_number"] == "1.0.0"
+
+        # Récupération de l'instance en BD
+        db_inst = await db.get(OrganizationPlugin, inst["id"])
+        assert db_inst is not None
 
         # B. OrganizationPluginVersion
         res_opv = await db.execute(
             select(OrganizationPluginVersion).where(
-                OrganizationPluginVersion.organization_id == org.id,
-                OrganizationPluginVersion.organization_plugin_id == inst.id,
+                OrganizationPluginVersion.organization_plugin_id == db_inst.id,
             )
         )
         opv = res_opv.scalars().first()
@@ -202,21 +206,21 @@ async def test_organization_resource_download_and_provisioning():
         # C. OrganizationFeature automatique pour "resources"
         res_feat = await db.execute(
             select(OrganizationFeature).where(
-                OrganizationFeature.organization_id == org.id,
+                OrganizationFeature.organization_plugin_id == db_inst.id,
                 OrganizationFeature.feature_code == "resources",
-                OrganizationFeature.organization_plugin_version_id == opv.id,
             )
         )
         feat = res_feat.scalars().first()
         assert feat is not None, "OrganizationFeature pour 'resources' doit être automatiquement créée !"
+        assert org.id in (feat.organization_ids or [])
         assert feat.status == "active"
 
         # D. OrganizationResource
         res_org_r = await db.execute(
             select(OrganizationResource).where(
                 OrganizationResource.organization_id == org.id,
-                OrganizationResource.organization_plugin_id == inst.id,
-                OrganizationResource.original_resource_id == source_res.id,
+                OrganizationResource.organization_plugin_version_id == opv.id,
+                OrganizationResource.source_resource_id == source_res.id,
             )
         )
         org_r = res_org_r.scalars().first()

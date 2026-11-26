@@ -6,14 +6,17 @@ from sqlalchemy import select, delete
 from app.db.database import SessionLocal
 from app.models.user.user import User, UserRole
 from app.models.organization.organization import Organization
+from app.models.organization.organization_plugin import (
+    OrganizationPlugin,
+    OrganizationPluginVersion,
+)
 from app.models.plugin.plugin import (
     Plugin,
     PluginVersion,
     PluginVersionTool,
     PluginStatus,
     PluginVersionStatus,
-    OrganizationPlugin,
-    OrgPluginStatus
+    OrgPluginStatus,
 )
 from app.models.project.project import Project, ProjectVersion
 from app.models.notification.notification import Notification
@@ -38,7 +41,7 @@ async def run_tests():
         # Nettoyer d'anciens plugins de test
         plugs_to_del = (await db.execute(select(Plugin.id).where(Plugin.code.in_(["test-pub-plug", "test-pub-private"])))).scalars().all()
         if plugs_to_del:
-            await db.execute(delete(OrganizationPlugin).where(OrganizationPlugin.plugin_id.in_(plugs_to_del)))
+            await db.execute(delete(OrganizationPlugin).where(OrganizationPlugin.source_plugin_id.in_(plugs_to_del)))
             await db.execute(delete(Plugin).where(Plugin.id.in_(plugs_to_del)))
             await db.commit()
 
@@ -229,10 +232,12 @@ async def run_tests():
             is_super_admin=False,
         )
         item_update = next((it for it in cat_update["items"] if it["plugin"].id == plugin.id), None)
+        inst_obj = item_update["installed_instance"]
+        inst_ver_id = inst_obj.get("installed_version_id") if isinstance(inst_obj, dict) else (getattr(inst_obj, "installed_version_id", None) if inst_obj else None)
         print("DEBUG item_update:", {
             "is_installed": item_update["is_installed"],
             "has_update": item_update["has_update_available"],
-            "installed_version_id": item_update["installed_instance"].installed_version_id if item_update["installed_instance"] else None,
+            "installed_version_id": inst_ver_id,
             "latest_version_id": item_update["latest_version"].id,
             "latest_version_num": item_update["latest_version"].version_number,
             "plugin_versions": [(v.id, v.version_number, v.status) for v in item_update["plugin"].versions],
@@ -254,7 +259,7 @@ async def run_tests():
         print("✓ Test I validé : Une nouvelle organisation voit le bouton 'Télécharger' pour v1.1.0")
 
         # Nettoyage
-        await db.execute(delete(OrganizationPlugin).where(OrganizationPlugin.plugin_id == plugin.id))
+        await db.execute(delete(OrganizationPlugin).where(OrganizationPlugin.source_plugin_id == plugin.id))
         await db.execute(delete(Plugin).where(Plugin.id == plugin.id))
         await db.commit()
         print("✓ Nettoyage effectué avec succès")

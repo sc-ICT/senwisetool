@@ -85,6 +85,21 @@ async def test_plugin_rules_7_8_9(async_client: AsyncClient, setup_db):
     assert "supprimée avec succès" in delete_draft_res.json()["message"]
 
     # 5. RÈGLE 8 : Publication de la première version avec détails exhaustifs du contenu
+    # Configuration préalable d'au moins un module/fonctionnalité
+    add_tool_res = await async_client.post(
+        f"/api/v1/plugins/{plugin_id}/versions/{draft_v1_id}/tools",
+        json={
+            "item_key": "tool_campaigns",
+            "tool_code": "campaigns",
+            "type": "feature",
+            "config_target": "tool_global",
+            "name": "Gestion des Campagnes",
+            "parameters": {},
+        },
+        headers=headers,
+    )
+    assert add_tool_res.status_code == 201
+
     # Si détails trop courts (< 10 caractères), doit échouer
     fail_pub_res = await async_client.post(
         f"/api/v1/plugins/{plugin_id}/versions/{draft_v1_id}/publish",
@@ -138,6 +153,20 @@ async def test_plugin_rules_7_8_9(async_client: AsyncClient, setup_db):
     assert create_v2_res.status_code == 201
     v2_id = create_v2_res.json()["id"]
 
+    # Configuration préalable d'au moins un module/fonctionnalité pour v2
+    await async_client.post(
+        f"/api/v1/plugins/{plugin_id}/versions/{v2_id}/tools",
+        json={
+            "item_key": "tool_projects_v2",
+            "tool_code": "projects",
+            "type": "feature",
+            "config_target": "tool_global",
+            "name": "Gestion des Projets",
+            "parameters": {},
+        },
+        headers=headers,
+    )
+
     # Publication de v1.1.0 avec précision des nouveautés
     pub_v2_res = await async_client.post(
         f"/api/v1/plugins/{plugin_id}/versions/{v2_id}/publish",
@@ -161,6 +190,20 @@ async def test_plugin_rules_7_8_9(async_client: AsyncClient, setup_db):
     )
     assert create_v3_res.status_code == 201
     v3_id = create_v3_res.json()["id"]
+
+    # Configuration préalable d'au moins un module/fonctionnalité pour v3
+    await async_client.post(
+        f"/api/v1/plugins/{plugin_id}/versions/{v3_id}/tools",
+        json={
+            "item_key": "tool_forms_v3",
+            "tool_code": "forms",
+            "type": "feature",
+            "config_target": "tool_global",
+            "name": "Moteur de Formulaires",
+            "parameters": {},
+        },
+        headers=headers,
+    )
 
     pub_v3_res = await async_client.post(
         f"/api/v1/plugins/{plugin_id}/versions/{v3_id}/publish",

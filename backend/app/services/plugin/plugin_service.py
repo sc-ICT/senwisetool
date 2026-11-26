@@ -997,7 +997,22 @@ class PluginService:
         # le système calcule lui-même et génère la comparaison exhaustive avec la version précédente.
         final_changelog = details_or_changelog or version.changelog
         if not final_changelog or len(final_changelog.strip()) < 10:
-            final_changelog = await self.generate_version_diff(db, plugin, version)
+            prev_ver_check = await db.execute(
+                select(PluginVersion)
+                .where(
+                    PluginVersion.plugin_id == plugin.id,
+                    PluginVersion.id != version.id,
+                    PluginVersion.status.in_([PluginVersionStatus.PUBLISHED.value, "published", "deprecated"])
+                )
+            )
+            has_prev_ver = prev_ver_check.scalars().first() is not None
+            if has_prev_ver:
+                final_changelog = await self.generate_version_diff(db, plugin, version)
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Impossible de publier la première version : vous devez obligatoirement détailler son contenu dans les notes de version (minimum 10 caractères)."
+                )
 
         version.changelog = final_changelog.strip()
 
@@ -1114,6 +1129,39 @@ class PluginService:
             raise HTTPException(
                 status_code=400,
                 detail="Seule une version actuellement publiée peut être dépréciée."
+            )
+
+        # Règle 10 : Impossible de déprécier l'unique version publiée (une version cible est requise pour la transition)
+        other_pub_versions = [
+            v for v in plugin.versions
+            if v.id != version.id and v.status == PluginVersionStatus.PUBLISHED.value
+        ]
+        if not other_pub_versions:
+            raise HTTPException(
+                status_code=400,
+                detail="Impossible de déprécier l'unique version publiée de ce plugin : aucune version alternative n'est disponible pour la transition des organisations."
+            )
+
+        # Règle 10 : Une seule dépréciation peut être en cours simultanément
+        active_deprecations = [
+            v for v in plugin.versions
+            if v.id != version.id and v.status == PluginVersionStatus.DEPRECATED.value
+        ]
+        if active_deprecations:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Impossible de déprécier cette version : un processus de dépréciation est déjà en cours pour la version v{active_deprecations[0].version_number}."
+            )
+
+        # Règle 10 : Ordre de dépréciation séquentiel (une version plus ancienne doit être dépréciée en premier)
+        older_pub_versions = [
+            v for v in other_pub_versions
+            if (v.id or 0) < (version.id or 0)
+        ]
+        if older_pub_versions:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Impossible de déprécier la version v{version.version_number} : une version plus ancienne (v{older_pub_versions[0].version_number}) est encore publiée et doit obligatoirement être dépréciée en premier."
             )
 
         now = datetime.now(timezone.utc)
@@ -1565,50 +1613,108 @@ class PluginService:
         )
         org_ver = opv_res.scalars().first()
 
-        if not org_ver:
-            # Première organisation à télécharger cette version spécifique
-            org_ver = OrganizationPluginVersion(
-                organization_plugin_id=org_plug.id,
-                source_plugin_version_id=version.id,
-                organization_ids=[org_id],
-                user_ids=[user.id],
-                version_number=version.version_number,
-                changelog=version.changelog,
-                package_data=version.package_data or {},
-                usage_policy=version.usage_policy,
-                status="active",
-                published_by_id=version.published_by_id,
-                published_at=version.published_at,
-                deprecated_at=version.deprecated_at,
-                deprecated_by_id=version.deprecated_by_id,
-                deprecated_eol_date=version.deprecated_eol_date,
-                deprecation_reason=version.deprecation_reason,
-                is_blocked=version.is_blocked,
-                settings=local_settings or {},
-                parameters=version.package_data or {},
-            )
-            db.add(org_ver)
-            await db.flush()
+        # Vérifier si d'autres organisations ont déjà téléchargé cette version
+        other_orgs_on_this_version = []
+        if org_ver and org_ver.organization_ids:
+            other_orgs_on_this_version = [oid for oid in org_ver.organization_ids if oid != org_id]
+
+        has_other_orgs_on_version = len(other_orgs_on_this_version) > 0
+
+        # Règle d'or : Si aucune autre organisation n'a encore téléchargé cette version,
+        # on vérifie si les informations du plugin ont été modifiées et on fait la mise à jour sur org_plug,
+        # et on ajoute ou synchronise les données de la version dans la table OrganizationPluginVersion.
+        if not has_other_orgs_on_version:
+            plugin_modified = False
+            for field in [
+                "name", "code", "category", "description", "short_description",
+                "icon_url", "banner_url", "author", "status", "is_public"
+            ]:
+                src_val = getattr(plugin, field, None)
+                curr_val = getattr(org_plug, field, None)
+                if src_val != curr_val:
+                    setattr(org_plug, field, src_val)
+                    plugin_modified = True
+
+            if (plugin.tags or []) != (org_plug.tags or []):
+                org_plug.tags = plugin.tags or []
+                flag_modified(org_plug, "tags")
+                plugin_modified = True
+
+            if (plugin.allowed_organization_ids or []) != (org_plug.allowed_organization_ids or []):
+                org_plug.allowed_organization_ids = plugin.allowed_organization_ids or []
+                flag_modified(org_plug, "allowed_organization_ids")
+                plugin_modified = True
+
+            if plugin_modified:
+                await db.flush()
+
+            if not org_ver:
+                # Ajouter les données de la version dans la table OrganizationPluginVersion
+                org_ver = OrganizationPluginVersion(
+                    organization_plugin_id=org_plug.id,
+                    source_plugin_version_id=version.id,
+                    organization_ids=[org_id],
+                    user_ids=[user.id],
+                    version_number=version.version_number,
+                    changelog=version.changelog,
+                    package_data=version.package_data or {},
+                    usage_policy=version.usage_policy,
+                    status="active",
+                    published_by_id=version.published_by_id,
+                    published_at=version.published_at,
+                    deprecated_at=version.deprecated_at,
+                    deprecated_by_id=version.deprecated_by_id,
+                    deprecated_eol_date=version.deprecated_eol_date,
+                    deprecation_reason=version.deprecation_reason,
+                    is_blocked=version.is_blocked,
+                    settings=local_settings or {},
+                    parameters=version.package_data or {},
+                )
+                db.add(org_ver)
+                await db.flush()
+            else:
+                org_ver.version_number = version.version_number
+                org_ver.changelog = version.changelog
+                org_ver.package_data = version.package_data or {}
+                org_ver.usage_policy = version.usage_policy
+                org_ver.status = "active"
+                curr_v_orgs = list(org_ver.organization_ids or [])
+                if org_id not in curr_v_orgs:
+                    curr_v_orgs.append(org_id)
+                    org_ver.organization_ids = curr_v_orgs
+                    flag_modified(org_ver, "organization_ids")
+                curr_v_users = list(org_ver.user_ids or [])
+                if user.id not in curr_v_users:
+                    curr_v_users.append(user.id)
+                    org_ver.user_ids = curr_v_users
+                    flag_modified(org_ver, "user_ids")
+                flag_modified(org_ver, "package_data")
+                await db.flush()
         else:
-            # Cette version est déjà enregistrée : ajout de l'organisation dans la liste
+            # D'autres organisations utilisent déjà cette version : associer org_id sans écraser les données
             curr_v_orgs = list(org_ver.organization_ids or [])
             if org_id not in curr_v_orgs:
                 curr_v_orgs.append(org_id)
                 org_ver.organization_ids = curr_v_orgs
                 flag_modified(org_ver, "organization_ids")
-
             curr_v_users = list(org_ver.user_ids or [])
             if user.id not in curr_v_users:
                 curr_v_users.append(user.id)
                 org_ver.user_ids = curr_v_users
                 flag_modified(org_ver, "user_ids")
-
-            org_ver.version_number = version.version_number
-            org_ver.changelog = version.changelog
-            org_ver.package_data = version.package_data or {}
-            org_ver.usage_policy = version.usage_policy
-            flag_modified(org_ver, "package_data")
             await db.flush()
+
+        # Retirer l'organisation de ses anciennes versions de ce même plugin pour assurer la cohérence de version active
+        old_vers_stmt = select(OrganizationPluginVersion).where(
+            OrganizationPluginVersion.organization_plugin_id == org_plug.id,
+            OrganizationPluginVersion.id != org_ver.id
+        )
+        old_vers = (await db.execute(old_vers_stmt)).scalars().all()
+        for ov in old_vers:
+            if ov.organization_ids and org_id in ov.organization_ids:
+                ov.organization_ids = [oid for oid in ov.organization_ids if oid != org_id]
+                flag_modified(ov, "organization_ids")
+        await db.flush()
 
         # 6. Copie intégrale des éléments embarqués par la version dans les tables locales de l'organisation
         await self._provision_embedded_elements(
@@ -1801,6 +1907,43 @@ class PluginService:
 
             t_params = tool.get("parameters") or {}
 
+            # Version de ressource source ciblée
+            rv_id = tool.get("selected_resource_version_id") or t_params.get("selected_resource_version_id")
+            source_rv = None
+            if rv_id:
+                source_rv = await db.get(ResourceVersion, int(rv_id))
+            if not source_rv:
+                pub_rv_stmt = select(ResourceVersion).where(
+                    ResourceVersion.resource_id == source_res.id,
+                    ResourceVersion.status == ResourceVersionStatus.PUBLISHED.value
+                ).order_by(desc(ResourceVersion.id))
+                source_rv = (await db.execute(pub_rv_stmt)).scalars().first()
+
+            # RÈGLE D'OPTIMISATION MAJEURE (Multi-Tenant & Inter-Version) :
+            # Si cette version spécifique du module a déjà été téléchargée par cette organisation
+            # pour une autre version du MÊME plugin, réutiliser ce qui est déjà téléchargé.
+            reused_rv = None
+            if source_rv:
+                prev_rv_stmt = (
+                    select(OrganizationResourceVersion)
+                    .join(
+                        OrganizationPluginVersion,
+                        OrganizationResourceVersion.organization_plugin_version_id == OrganizationPluginVersion.id
+                    )
+                    .where(
+                        OrganizationResourceVersion.organization_id == org_id,
+                        OrganizationResourceVersion.source_resource_version_id == source_rv.id,
+                        OrganizationPluginVersion.organization_plugin_id == org_plug.id
+                    )
+                )
+                reused_rv = (await db.execute(prev_rv_stmt)).scalars().first()
+
+            if reused_rv:
+                # Réutilisation directe sans re-téléchargement ni recréation des items
+                res_source_to_local[source_res.id] = reused_rv.organization_resource_id
+                res_ver_source_to_local[source_rv.id] = reused_rv.id
+                continue
+
             # Recherche ou création de OrganizationResource
             ores_stmt = select(OrganizationResource).where(
                 OrganizationResource.organization_id == org_id,
@@ -1847,18 +1990,6 @@ class PluginService:
                 await db.flush()
 
             res_source_to_local[source_res.id] = org_res.id
-
-            # Version de ressource (OrganizationResourceVersion)
-            rv_id = tool.get("selected_resource_version_id") or t_params.get("selected_resource_version_id")
-            source_rv = None
-            if rv_id:
-                source_rv = await db.get(ResourceVersion, int(rv_id))
-            if not source_rv:
-                pub_rv_stmt = select(ResourceVersion).where(
-                    ResourceVersion.resource_id == source_res.id,
-                    ResourceVersion.status == ResourceVersionStatus.PUBLISHED.value
-                ).order_by(desc(ResourceVersion.id))
-                source_rv = (await db.execute(pub_rv_stmt)).scalars().first()
 
             if source_rv:
                 orv_stmt = select(OrganizationResourceVersion).where(
@@ -1986,6 +2117,31 @@ class PluginService:
                     FormVersion.status.in_(("published", "active"))
                 ).order_by(desc(FormVersion.id))
                 source_fv = (await db.execute(pub_fv_stmt)).scalars().first()
+
+            # RÈGLE D'OPTIMISATION MAJEURE (Formulaires) :
+            # Si cette version spécifique du formulaire a déjà été téléchargée par cette organisation
+            # pour une autre version du MÊME plugin, réutiliser ce qui est déjà téléchargé là.
+            reused_fv = None
+            if source_fv:
+                prev_fv_stmt = (
+                    select(OrganizationFormVersion)
+                    .join(
+                        OrganizationPluginVersion,
+                        OrganizationFormVersion.organization_plugin_version_id == OrganizationPluginVersion.id
+                    )
+                    .where(
+                        OrganizationFormVersion.organization_id == org_id,
+                        OrganizationFormVersion.source_form_version_id == source_fv.id,
+                        OrganizationPluginVersion.organization_plugin_id == org_plug.id
+                    )
+                )
+                reused_fv = (await db.execute(prev_fv_stmt)).scalars().first()
+
+            if reused_fv:
+                # Réutilisation directe sans recréation des sections ni des questions
+                form_source_to_local[source_form.id] = reused_fv.organization_form_id
+                form_ver_source_to_local[source_fv.id] = reused_fv.id
+                continue
 
             if source_fv:
                 ofv_stmt = select(OrganizationFormVersion).where(
@@ -2264,6 +2420,30 @@ class PluginService:
                 ).order_by(desc(ProjectVersion.id))
                 source_pv = (await db.execute(pub_pv_stmt)).scalars().first()
 
+            # RÈGLE D'OPTIMISATION MAJEURE (Projets) :
+            # Si cette version spécifique du projet a déjà été téléchargée par cette organisation
+            # pour une autre version du MÊME plugin, réutiliser ce qui est déjà téléchargé là.
+            reused_pv = None
+            if source_pv:
+                prev_pv_stmt = (
+                    select(OrganizationProjectVersion)
+                    .join(
+                        OrganizationPluginVersion,
+                        OrganizationProjectVersion.organization_plugin_version_id == OrganizationPluginVersion.id
+                    )
+                    .where(
+                        OrganizationProjectVersion.organization_id == org_id,
+                        OrganizationProjectVersion.source_project_version_id == source_pv.id,
+                        OrganizationPluginVersion.organization_plugin_id == org_plug.id
+                    )
+                )
+                reused_pv = (await db.execute(prev_pv_stmt)).scalars().first()
+
+            if reused_pv:
+                proj_source_to_local[source_proj.id] = reused_pv.organization_project_id
+                proj_ver_source_to_local[source_pv.id] = reused_pv.id
+                continue
+
             if source_pv:
                 opv_stmt = select(OrganizationProjectVersion).where(
                     OrganizationProjectVersion.organization_id == org_id,
@@ -2369,6 +2549,30 @@ class PluginService:
                 ).order_by(desc(CampaignVersion.id))
                 source_cv = (await db.execute(pub_cv_stmt)).scalars().first()
 
+            # RÈGLE D'OPTIMISATION MAJEURE (Campagnes) :
+            # Si cette version spécifique de campagne a déjà été téléchargée par cette organisation
+            # pour une autre version du MÊME plugin, réutiliser ce qui est déjà téléchargé là.
+            reused_cv = None
+            if source_cv:
+                prev_cv_stmt = (
+                    select(OrganizationCampaignVersion)
+                    .join(
+                        OrganizationPluginVersion,
+                        OrganizationCampaignVersion.organization_plugin_version_id == OrganizationPluginVersion.id
+                    )
+                    .where(
+                        OrganizationCampaignVersion.organization_id == org_id,
+                        OrganizationCampaignVersion.source_campaign_version_id == source_cv.id,
+                        OrganizationPluginVersion.organization_plugin_id == org_plug.id
+                    )
+                )
+                reused_cv = (await db.execute(prev_cv_stmt)).scalars().first()
+
+            if reused_cv:
+                camp_source_to_local[source_camp.id] = reused_cv.organization_campaign_id
+                camp_ver_source_to_local[source_cv.id] = reused_cv.id
+                continue
+
             if source_cv:
                 ocv_stmt = select(OrganizationCampaignVersion).where(
                     OrganizationCampaignVersion.organization_id == org_id,
@@ -2447,10 +2651,15 @@ class PluginService:
                     "settings": tool.get("parameters") or {},
                 }
 
+        # Appliquer les fonctionnalités actives sur la version dans le workspace
+        current_active_features = set((org_ver.settings or {}).get("active_features", []))
         for f_code, f_data in features_to_sync.items():
+            current_active_features.add(f_code)
+
+            # Règle d'or : Si une fonctionnalité n'a jamais été ajoutée pour l'organisation,
+            # on l'ajoute dans la table OrganizationFeature et on l'applique sur la version.
             of_stmt = select(OrganizationFeature).where(
                 OrganizationFeature.organization_plugin_id == org_plug.id,
-                OrganizationFeature.organization_plugin_version_id == org_ver.id,
                 OrganizationFeature.feature_code == f_code,
             )
             org_feat = (await db.execute(of_stmt)).scalars().first()
@@ -2493,153 +2702,135 @@ class PluginService:
                 flag_modified(org_feat, "settings")
                 await db.flush()
 
+        # Synchronisation des active_features sur la version et le plugin de l'organisation
+        active_features_list = sorted(list(current_active_features))
+        v_settings = dict(org_ver.settings or {})
+        v_settings["active_features"] = active_features_list
+        org_ver.settings = v_settings
+        flag_modified(org_ver, "settings")
+
+        v_params = dict(org_ver.parameters or {})
+        v_params["active_features"] = active_features_list
+        org_ver.parameters = v_params
+        flag_modified(org_ver, "parameters")
+
+        p_settings = dict(org_plug.settings or {})
+        p_settings["active_features"] = active_features_list
+        org_plug.settings = p_settings
+        flag_modified(org_plug, "settings")
+        await db.flush()
+
         # =========================================================================
         # 6. RE-CÂBLAGE INTERNE ET COHÉRENCE DES DÉPENDANCES LOCALES
         # =========================================================================
         # a) Questions de formulaire : re-câbler resource_binding vers les tables locales OrganizationResource
-        org_qs_stmt = select(OrganizationFormQuestion).where(
-            OrganizationFormQuestion.organization_id == org_id,
-            OrganizationFormQuestion.organization_plugin_version_id == org_ver.id
-        )
-        org_questions = (await db.execute(org_qs_stmt)).scalars().all()
+        target_fv_ids = list(form_ver_source_to_local.values())
+        if target_fv_ids:
+            org_qs_stmt = select(OrganizationFormQuestion).where(
+                OrganizationFormQuestion.organization_id == org_id,
+                OrganizationFormQuestion.organization_form_version_id.in_(target_fv_ids)
+            )
+            org_questions = (await db.execute(org_qs_stmt)).scalars().all()
 
-        for q in org_questions:
-            binding = dict(q.resource_binding or {})
-            changed_b = False
-            if binding.get("resource_id"):
-                orig_rid = binding.get("resource_id")
-                if orig_rid in res_source_to_local:
-                    binding["resource_id"] = res_source_to_local[orig_rid]
-                    changed_b = True
-            if binding.get("resource_version_id"):
-                orig_rvid = binding.get("resource_version_id")
-                if orig_rvid in res_ver_source_to_local:
-                    binding["resource_version_id"] = res_ver_source_to_local[orig_rvid]
-                    changed_b = True
-            if binding.get("form_id"):
-                orig_fid = binding.get("form_id")
-                if orig_fid in form_source_to_local:
-                    binding["form_id"] = form_source_to_local[orig_fid]
-                    changed_b = True
+            for q in org_questions:
+                binding = dict(q.resource_binding or {})
+                changed_b = False
+                if binding.get("resource_id"):
+                    orig_rid = binding.get("resource_id")
+                    if orig_rid in res_source_to_local:
+                        binding["resource_id"] = res_source_to_local[orig_rid]
+                        changed_b = True
+                if binding.get("resource_version_id"):
+                    orig_rvid = binding.get("resource_version_id")
+                    if orig_rvid in res_ver_source_to_local:
+                        binding["resource_version_id"] = res_ver_source_to_local[orig_rvid]
+                        changed_b = True
+                if binding.get("form_id"):
+                    orig_fid = binding.get("form_id")
+                    if orig_fid in form_source_to_local:
+                        binding["form_id"] = form_source_to_local[orig_fid]
+                        changed_b = True
 
-            if changed_b:
-                q.resource_binding = binding
-                flag_modified(q, "resource_binding")
+                if changed_b:
+                    q.resource_binding = binding
+                    flag_modified(q, "resource_binding")
 
-            # Re-câbler également q.settings
-            q_settings = dict(q.settings or {})
-            changed_s = False
-            if q_settings.get("resource_id"):
-                orig_rid = q_settings.get("resource_id")
-                if orig_rid in res_source_to_local:
-                    q_settings["resource_id"] = res_source_to_local[orig_rid]
-                    changed_s = True
-            if q_settings.get("resource_version_id"):
-                orig_rvid = q_settings.get("resource_version_id")
-                if orig_rvid in res_ver_source_to_local:
-                    q_settings["resource_version_id"] = res_ver_source_to_local[orig_rvid]
-                    changed_s = True
-            if q_settings.get("form_id"):
-                orig_fid = q_settings.get("form_id")
-                if orig_fid in form_source_to_local:
-                    q_settings["form_id"] = form_source_to_local[orig_fid]
-                    changed_s = True
+                # Re-câbler également q.settings
+                q_settings = dict(q.settings or {})
+                changed_s = False
+                if q_settings.get("resource_id"):
+                    orig_rid = q_settings.get("resource_id")
+                    if orig_rid in res_source_to_local:
+                        q_settings["resource_id"] = res_source_to_local[orig_rid]
+                        changed_s = True
+                if q_settings.get("resource_version_id"):
+                    orig_rvid = q_settings.get("resource_version_id")
+                    if orig_rvid in res_ver_source_to_local:
+                        q_settings["resource_version_id"] = res_ver_source_to_local[orig_rvid]
+                        changed_s = True
+                if q_settings.get("form_id"):
+                    orig_fid = q_settings.get("form_id")
+                    if orig_fid in form_source_to_local:
+                        q_settings["form_id"] = form_source_to_local[orig_fid]
+                        changed_s = True
 
-            if changed_s:
-                q.settings = q_settings
-                flag_modified(q, "settings")
+                if changed_s:
+                    q.settings = q_settings
+                    flag_modified(q, "settings")
 
         # b) Projets : re-câbler attached_form_ids et attached_form_versions vers OrganizationForm locaux
-        org_pvs_stmt = select(OrganizationProjectVersion).where(
-            OrganizationProjectVersion.organization_id == org_id,
-            OrganizationProjectVersion.organization_plugin_version_id == org_ver.id
-        )
-        org_pvs = (await db.execute(org_pvs_stmt)).scalars().all()
+        target_pv_ids = list(proj_ver_source_to_local.values())
+        if target_pv_ids:
+            org_pvs_stmt = select(OrganizationProjectVersion).where(
+                OrganizationProjectVersion.organization_id == org_id,
+                OrganizationProjectVersion.id.in_(target_pv_ids)
+            )
+            org_pvs = (await db.execute(org_pvs_stmt)).scalars().all()
 
-        for pv in org_pvs:
-            for field in ("settings", "parameters"):
-                f_dict = dict(getattr(pv, field) or {})
-                changed_f = False
-                attached = f_dict.get("attached_form_ids", [])
-                if attached:
-                    f_dict["attached_form_ids"] = [form_source_to_local.get(int(fid), fid) for fid in attached if str(fid).isdigit()]
-                    changed_f = True
-                attached_ver = f_dict.get("attached_form_version_ids", [])
-                if attached_ver:
-                    f_dict["attached_form_version_ids"] = [form_ver_source_to_local.get(int(fvid), fvid) for fvid in attached_ver if str(fvid).isdigit()]
-                    changed_f = True
-                attached_fvs = f_dict.get("attached_form_versions", [])
-                if attached_fvs:
-                    new_fvs = []
-                    for afv in attached_fvs:
-                        afv_copy = dict(afv)
-                        raw_fid = afv_copy.get("form_id")
-                        if raw_fid and str(raw_fid).isdigit() and int(raw_fid) in form_source_to_local:
-                            afv_copy["form_id"] = form_source_to_local[int(raw_fid)]
-                        raw_fvid = afv_copy.get("form_version_id")
-                        if raw_fvid and str(raw_fvid).isdigit() and int(raw_fvid) in form_ver_source_to_local:
-                            afv_copy["form_version_id"] = form_ver_source_to_local[int(raw_fvid)]
-                        new_fvs.append(afv_copy)
-                    f_dict["attached_form_versions"] = new_fvs
-                    changed_f = True
-                if changed_f:
-                    setattr(pv, field, f_dict)
-                    flag_modified(pv, field)
+            for pv in org_pvs:
+                for field in ("settings", "parameters"):
+                    f_dict = dict(getattr(pv, field) or {})
+                    changed_f = False
+                    attached = f_dict.get("attached_form_ids", [])
+                    if attached:
+                        f_dict["attached_form_ids"] = [form_source_to_local.get(int(fid), fid) for fid in attached if str(fid).isdigit()]
+                        changed_f = True
+                    attached_ver = f_dict.get("attached_form_version_ids", [])
+                    if attached_ver:
+                        f_dict["attached_form_version_ids"] = [form_ver_source_to_local.get(int(fvid), fvid) for fvid in attached_ver if str(fvid).isdigit()]
+                        changed_f = True
+                    attached_fvs = f_dict.get("attached_form_versions", [])
+                    if attached_fvs:
+                        new_fvs = []
+                        for afv in attached_fvs:
+                            afv_copy = dict(afv)
+                            raw_fid = afv_copy.get("form_id")
+                            if raw_fid and str(raw_fid).isdigit() and int(raw_fid) in form_source_to_local:
+                                afv_copy["form_id"] = form_source_to_local[int(raw_fid)]
+                            raw_fvid = afv_copy.get("form_version_id")
+                            if raw_fvid and str(raw_fvid).isdigit() and int(raw_fvid) in form_ver_source_to_local:
+                                afv_copy["form_version_id"] = form_ver_source_to_local[int(raw_fvid)]
+                            new_fvs.append(afv_copy)
+                        f_dict["attached_form_versions"] = new_fvs
+                        changed_f = True
+                    if changed_f:
+                        setattr(pv, field, f_dict)
+                        flag_modified(pv, field)
 
         # c) Campagnes : re-câbler target_forms et target_projects vers les enregistrements locaux
-        org_cvs_stmt = select(OrganizationCampaignVersion).where(
-            OrganizationCampaignVersion.organization_id == org_id,
-            OrganizationCampaignVersion.organization_plugin_version_id == org_ver.id
-        )
-        org_cvs = (await db.execute(org_cvs_stmt)).scalars().all()
+        target_cv_ids = list(camp_ver_source_to_local.values())
+        if target_cv_ids:
+            org_cvs_stmt = select(OrganizationCampaignVersion).where(
+                OrganizationCampaignVersion.organization_id == org_id,
+                OrganizationCampaignVersion.id.in_(target_cv_ids)
+            )
+            org_cvs = (await db.execute(org_cvs_stmt)).scalars().all()
 
-        for cv in org_cvs:
-            cv_forms = cv.target_forms or []
-            if cv_forms:
-                remapped_forms = []
-                for f_item in cv_forms:
-                    if isinstance(f_item, dict):
-                        f_copy = dict(f_item)
-                        orig_fid = f_copy.get("form_id") or f_copy.get("id")
-                        if orig_fid is not None and int(orig_fid) in form_source_to_local:
-                            local_fid = form_source_to_local[int(orig_fid)]
-                            f_copy["id"] = local_fid
-                            f_copy["form_id"] = local_fid
-                        if f_copy.get("source_project_id") is not None and int(f_copy["source_project_id"]) in proj_source_to_local:
-                            f_copy["source_project_id"] = proj_source_to_local[int(f_copy["source_project_id"])]
-                        remapped_forms.append(f_copy)
-                    elif str(f_item).isdigit():
-                        remapped_forms.append(form_source_to_local.get(int(f_item), f_item))
-                    else:
-                        remapped_forms.append(f_item)
-                cv.target_forms = remapped_forms
-                flag_modified(cv, "target_forms")
-
-            cv_projs = cv.target_projects or []
-            if cv_projs:
-                remapped_projs = []
-                for p_item in cv_projs:
-                    if isinstance(p_item, dict):
-                        p_copy = dict(p_item)
-                        orig_pid = p_copy.get("project_id") or p_copy.get("id")
-                        if orig_pid is not None and int(orig_pid) in proj_source_to_local:
-                            local_pid = proj_source_to_local[int(orig_pid)]
-                            p_copy["id"] = local_pid
-                            p_copy["project_id"] = local_pid
-                        remapped_projs.append(p_copy)
-                    elif str(p_item).isdigit():
-                        remapped_projs.append(proj_source_to_local.get(int(p_item), p_item))
-                    else:
-                        remapped_projs.append(p_item)
-                cv.target_projects = remapped_projs
-                flag_modified(cv, "target_projects")
-
-            for field in ("settings", "parameters"):
-                f_dict = dict(getattr(cv, field) or {})
-                changed_c = False
-                if "target_forms" in f_dict and isinstance(f_dict["target_forms"], list):
-                    remapped_f = []
-                    for f_item in f_dict["target_forms"]:
+            for cv in org_cvs:
+                cv_forms = cv.target_forms or []
+                if cv_forms:
+                    remapped_forms = []
+                    for f_item in cv_forms:
                         if isinstance(f_item, dict):
                             f_copy = dict(f_item)
                             orig_fid = f_copy.get("form_id") or f_copy.get("id")
@@ -2649,16 +2840,18 @@ class PluginService:
                                 f_copy["form_id"] = local_fid
                             if f_copy.get("source_project_id") is not None and int(f_copy["source_project_id"]) in proj_source_to_local:
                                 f_copy["source_project_id"] = proj_source_to_local[int(f_copy["source_project_id"])]
-                            remapped_f.append(f_copy)
+                            remapped_forms.append(f_copy)
                         elif str(f_item).isdigit():
-                            remapped_f.append(form_source_to_local.get(int(f_item), f_item))
+                            remapped_forms.append(form_source_to_local.get(int(f_item), f_item))
                         else:
-                            remapped_f.append(f_item)
-                    f_dict["target_forms"] = remapped_f
-                    changed_c = True
-                if "target_projects" in f_dict and isinstance(f_dict["target_projects"], list):
-                    remapped_p = []
-                    for p_item in f_dict["target_projects"]:
+                            remapped_forms.append(f_item)
+                    cv.target_forms = remapped_forms
+                    flag_modified(cv, "target_forms")
+
+                cv_projs = cv.target_projects or []
+                if cv_projs:
+                    remapped_projs = []
+                    for p_item in cv_projs:
                         if isinstance(p_item, dict):
                             p_copy = dict(p_item)
                             orig_pid = p_copy.get("project_id") or p_copy.get("id")
@@ -2666,16 +2859,56 @@ class PluginService:
                                 local_pid = proj_source_to_local[int(orig_pid)]
                                 p_copy["id"] = local_pid
                                 p_copy["project_id"] = local_pid
-                            remapped_p.append(p_copy)
+                            remapped_projs.append(p_copy)
                         elif str(p_item).isdigit():
-                            remapped_p.append(proj_source_to_local.get(int(p_item), p_item))
+                            remapped_projs.append(proj_source_to_local.get(int(p_item), p_item))
                         else:
-                            remapped_p.append(p_item)
-                    f_dict["target_projects"] = remapped_p
-                    changed_c = True
-                if changed_c:
-                    setattr(cv, field, f_dict)
-                    flag_modified(cv, field)
+                            remapped_projs.append(p_item)
+                    cv.target_projects = remapped_projs
+                    flag_modified(cv, "target_projects")
+
+                for field in ("settings", "parameters"):
+                    f_dict = dict(getattr(cv, field) or {})
+                    changed_c = False
+                    if "target_forms" in f_dict and isinstance(f_dict["target_forms"], list):
+                        remapped_f = []
+                        for f_item in f_dict["target_forms"]:
+                            if isinstance(f_item, dict):
+                                f_copy = dict(f_item)
+                                orig_fid = f_copy.get("form_id") or f_copy.get("id")
+                                if orig_fid is not None and int(orig_fid) in form_source_to_local:
+                                    local_fid = form_source_to_local[int(orig_fid)]
+                                    f_copy["id"] = local_fid
+                                    f_copy["form_id"] = local_fid
+                                if f_copy.get("source_project_id") is not None and int(f_copy["source_project_id"]) in proj_source_to_local:
+                                    f_copy["source_project_id"] = proj_source_to_local[int(f_copy["source_project_id"])]
+                                remapped_f.append(f_copy)
+                            elif str(f_item).isdigit():
+                                remapped_f.append(form_source_to_local.get(int(f_item), f_item))
+                            else:
+                                remapped_f.append(f_item)
+                        f_dict["target_forms"] = remapped_f
+                        changed_c = True
+                    if "target_projects" in f_dict and isinstance(f_dict["target_projects"], list):
+                        remapped_p = []
+                        for p_item in f_dict["target_projects"]:
+                            if isinstance(p_item, dict):
+                                p_copy = dict(p_item)
+                                orig_pid = p_copy.get("project_id") or p_copy.get("id")
+                                if orig_pid is not None and int(orig_pid) in proj_source_to_local:
+                                    local_pid = proj_source_to_local[int(orig_pid)]
+                                    p_copy["id"] = local_pid
+                                    p_copy["project_id"] = local_pid
+                                remapped_p.append(p_copy)
+                            elif str(p_item).isdigit():
+                                remapped_p.append(proj_source_to_local.get(int(p_item), p_item))
+                            else:
+                                remapped_p.append(p_item)
+                        f_dict["target_projects"] = remapped_p
+                        changed_c = True
+                    if changed_c:
+                        setattr(cv, field, f_dict)
+                        flag_modified(cv, field)
 
         await db.flush()
 
