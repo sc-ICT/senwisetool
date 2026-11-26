@@ -232,3 +232,157 @@ async def test_campaign_project_and_cascading_forms_association(setup_db):
         assert len(camp_ver.target_forms) == 1
         assert camp_ver.target_forms[0]["form_id"] == form1.id
         assert camp_ver.target_forms[0]["source_project_id"] == project.id
+
+
+@pytest.mark.asyncio
+async def test_campaign_exclusive_affinity_rule(setup_db):
+    """
+    Vérifie la règle d'exclusivité stricte (Single Campaign Affinity) :
+    1. Un projet (et toutes ses versions) associé à Campagne A NE PEUT PAS être associé à Campagne B (HTTP 400).
+    2. Un formulaire (et toutes ses versions) associé à Campagne A NE PEUT PAS être associé à Campagne B (HTTP 400).
+    3. L'association peut être effectuée sur une AUTRE version de la MÊME campagne A avec succès.
+    """
+    from tests.conftest import TestingSessionLocal
+
+    async with TestingSessionLocal() as session:
+        user = User(
+            email="excl_admin@senma.com",
+            username="excl_admin",
+            hashed_password=security.get_password_hash("Password123!"),
+            full_name="Excl Admin",
+            role=UserRole.SUPER_ADMIN,
+            status=UserStatus.ACTIVE,
+            is_email_verified=True,
+        )
+        session.add(user)
+        await session.flush()
+
+        # Projet et version publiée
+        project = Project(
+            name="Projet Exclusif",
+            code="PRJ_EXCL_001",
+            created_by_id=user.id,
+        )
+        session.add(project)
+        await session.flush()
+
+        proj_ver = ProjectVersion(
+            project_id=project.id,
+            version_number="1.0.0",
+            status=ProjectStatus.PUBLISHED.value,
+            settings={},
+            created_by_id=user.id,
+        )
+        session.add(proj_ver)
+
+        # Formulaire autonome et version publiée
+        form_standalone = Form(
+            name="Formulaire Autonome Exclusif",
+            code="FORM_EXCL_001",
+            version="1.0.0",
+            status=FormStatus.PUBLISHED.value,
+            created_by_id=user.id,
+        )
+        session.add(form_standalone)
+        await session.flush()
+
+        form_ver = FormVersion(
+            form_id=form_standalone.id,
+            version_number="1.0.0",
+            status=FormVersionStatus.PUBLISHED.value,
+            created_by_id=user.id,
+        )
+        session.add(form_ver)
+
+        # Campagne A
+        camp_a = Campaign(
+            name="Campagne Alpha",
+            code="CAMP_ALPHA",
+            status=CampaignStatus.DRAFT.value,
+            version="1.0.0",
+            created_by_id=user.id,
+        )
+        session.add(camp_a)
+        await session.flush()
+
+        camp_a_v1 = CampaignVersion(
+            campaign_id=camp_a.id,
+            version_number="1.0.0",
+            status=CampaignVersionStatus.DRAFT.value,
+            target_projects=[],
+            target_forms=[],
+            created_by_id=user.id,
+        )
+        session.add(camp_a_v1)
+
+        # Campagne B
+        camp_b = Campaign(
+            name="Campagne Beta",
+            code="CAMP_BETA",
+            status=CampaignStatus.DRAFT.value,
+            version="1.0.0",
+            created_by_id=user.id,
+        )
+        session.add(camp_b)
+        await session.flush()
+
+        camp_b_v1 = CampaignVersion(
+            campaign_id=camp_b.id,
+            version_number="1.0.0",
+            status=CampaignVersionStatus.DRAFT.value,
+            target_projects=[],
+            target_forms=[],
+            created_by_id=user.id,
+        )
+        session.add(camp_b_v1)
+        await session.commit()
+
+        # 1. Associer le projet et le formulaire à la Campagne A v1.0.0 avec versions spécifiques
+        await campaign_service.attach_project_to_campaign_version(
+            db=session,
+            campaign_id=camp_a.id,
+            version_id=camp_a_v1.id,
+            project_id=project.id,
+            project_version_id=proj_ver.id,
+            user=user,
+        )
+        await campaign_service.attach_form_to_campaign_version(
+            db=session,
+            campaign_id=camp_a.id,
+            version_id=camp_a_v1.id,
+            form_id=form_standalone.id,
+            form_version_id=form_ver.id,
+            user=user,
+        )
+
+        assert len(camp_a_v1.target_projects) == 1
+        assert camp_a_v1.target_projects[0]["project_version_id"] == proj_ver.id
+        assert camp_a_v1.target_projects[0]["version_number"] == "1.0.0"
+
+        assert len(camp_a_v1.target_forms) == 1
+        assert camp_a_v1.target_forms[0]["form_version_id"] == form_ver.id
+        assert camp_a_v1.target_forms[0]["version_number"] == "1.0.0"
+
+        # 2. Tentative d'associer le MEME projet à Campagne B -> REJET STRICT HTTP 400
+        with pytest.raises(HTTPException) as exc_p:
+            await campaign_service.attach_project_to_campaign_version(
+                db=session,
+                campaign_id=camp_b.id,
+                version_id=camp_b_v1.id,
+                project_id=project.id,
+                user=user,
+            )
+        assert exc_p.value.status_code == 400
+        assert "seule et même campagne" in exc_p.value.detail.lower()
+
+        # 3. Tentative d'associer le MEME formulaire à Campagne B -> REJET STRICT HTTP 400
+        with pytest.raises(HTTPException) as exc_f:
+            await campaign_service.attach_form_to_campaign_version(
+                db=session,
+                campaign_id=camp_b.id,
+                version_id=camp_b_v1.id,
+                form_id=form_standalone.id,
+                user=user,
+            )
+        assert exc_f.value.status_code == 400
+        assert "seule et même campagne" in exc_f.value.detail.lower()

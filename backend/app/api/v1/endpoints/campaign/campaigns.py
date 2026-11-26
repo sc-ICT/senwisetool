@@ -300,18 +300,21 @@ async def delete_campaign_version(
 @router.post(
     "/{campaign_id}/versions/{version_id}/projects/attach/{project_id}",
     response_model=CampaignResponse,
-    summary="Associer un projet et tous ses formulaires à une version de campagne",
+    summary="Associer une version spécifique de projet et ses formulaires à une version de campagne",
 )
 async def attach_project_to_campaign_version(
     campaign_id: int,
     version_id: int,
     project_id: int,
+    project_version_id: Optional[int] = Query(None, description="ID spécifique de la version du projet à associer"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """
-    Associe un projet dans sa globalité à une version de campagne.
-    Règle : Toutes ses versions sont liées, et tous ses formulaires associés sont automatiquement intégrés dans la campagne.
+    Associe une version spécifique d'un projet à une version de campagne.
+    Règles d'or :
+    - Exclusivité stricte : Un projet ne peut être associé qu'aux versions d'une seule et même campagne.
+    - Seuls les formulaires liés à la version sélectionnée du projet sont intégrés en cascade.
     """
     return await campaign_service.attach_project_to_campaign_version(
         db=db,
@@ -319,6 +322,7 @@ async def attach_project_to_campaign_version(
         version_id=version_id,
         project_id=project_id,
         user=current_user,
+        project_version_id=project_version_id,
     )
 
 
@@ -346,17 +350,20 @@ async def detach_project_from_campaign_version(
 @router.post(
     "/{campaign_id}/versions/{version_id}/forms/attach/{form_id}",
     response_model=CampaignResponse,
-    summary="Associer un formulaire autonome à une version de campagne",
+    summary="Associer une version spécifique de formulaire autonome à une version de campagne",
 )
 async def attach_form_to_campaign_version(
     campaign_id: int,
     version_id: int,
     form_id: int,
+    form_version_id: Optional[int] = Query(None, description="ID spécifique de la version du formulaire à associer"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """
-    Associe un formulaire dans sa globalité à une version de campagne.
+    Associe une version spécifique d'un formulaire autonome à une version de campagne.
+    Règles d'or :
+    - Exclusivité stricte : Un formulaire ne peut être associé qu'aux versions d'une seule et même campagne.
     """
     return await campaign_service.attach_form_to_campaign_version(
         db=db,
@@ -364,6 +371,7 @@ async def attach_form_to_campaign_version(
         version_id=version_id,
         form_id=form_id,
         user=current_user,
+        form_version_id=form_version_id,
     )
 
 
