@@ -771,6 +771,184 @@ class PluginService:
         await db.commit()
         return True
 
+    async def generate_version_diff(
+        self,
+        db: AsyncSession,
+        plugin: Plugin,
+        current_version: PluginVersion,
+        base_version: Optional[PluginVersion] = None,
+    ) -> str:
+        """
+        Génère automatiquement une comparaison exhaustive et structurée (diff)
+        entre la version actuelle et la version précédente (ou base_version).
+        Utilisé pour peupler automatiquement le changelog si l'utilisateur ne l'a pas rédigé,
+        ou pour présenter les changements sur le SenWiseStore.
+        """
+        # Trouver la version de référence si non spécifiée
+        ref_version = base_version
+        if not ref_version:
+            # Chercher la version source explicite si configurée
+            if getattr(current_version, "source_version_id", None):
+                src_res = await db.execute(
+                    select(PluginVersion).where(PluginVersion.id == current_version.source_version_id)
+                )
+                ref_version = src_res.scalars().first()
+
+            # Sinon, chercher la version publiée la plus récente avant celle-ci
+            if not ref_version:
+                prev_res = await db.execute(
+                    select(PluginVersion)
+                    .where(
+                        PluginVersion.plugin_id == plugin.id,
+                        PluginVersion.id != current_version.id,
+                        PluginVersion.status.in_([PluginVersionStatus.PUBLISHED.value, "published", "deprecated"])
+                    )
+                    .order_by(desc(PluginVersion.id))
+                )
+                ref_version = prev_res.scalars().first()
+
+        # Outils de la version courante
+        cur_tools_res = await db.execute(
+            select(PluginVersionTool).where(PluginVersionTool.plugin_version_id == current_version.id)
+        )
+        cur_tools_list = cur_tools_res.scalars().all()
+        cur_tools_map = {t.item_key: t for t in cur_tools_list}
+
+        # Compléter avec package_data si PluginVersionTool était vide
+        if not cur_tools_map and current_version.package_data:
+            pkg_tools = (current_version.package_data or {}).get("tools") or []
+            for pt in pkg_tools:
+                ik = pt.get("item_key") or f"{pt.get('tool_code')}_{pt.get('selected_resource_id') or 0}"
+                cur_tools_map[ik] = pt
+
+        # Si aucune version de référence (version initiale)
+        if not ref_version:
+            lines = [
+                f"### 🚀 Version Initiale (v{current_version.version_number})",
+                "",
+                f"Cette version initiale pose les fondations opérationnelles du plugin **{plugin.name}** sur le SenWiseStore.",
+                "",
+                "#### 📦 Modules et fonctionnalités inclus :",
+            ]
+            if not cur_tools_map:
+                lines.append("- *Aucun module spécifique configuré.*")
+            else:
+                for k, t in cur_tools_map.items():
+                    name = getattr(t, "name", None) or (t.get("name") if isinstance(t, dict) else k)
+                    code = getattr(t, "tool_code", None) or (t.get("tool_code") if isinstance(t, dict) else "")
+                    mode = getattr(t, "distribution_mode", None) or (t.get("distribution_mode") if isinstance(t, dict) else "tenant")
+                    params = getattr(t, "parameters", None) or (t.get("parameters") if isinstance(t, dict) else {}) or {}
+                    ver_num = (
+                        params.get("selected_form_version_number")
+                        or params.get("selected_resource_version_number")
+                        or params.get("selected_campaign_version_number")
+                        or params.get("selected_project_version_number")
+                        or params.get("version")
+                    )
+                    ver_suffix = f" (v{ver_num})" if ver_num else ""
+                    lines.append(f"- **{name}**{ver_suffix} `[{code}]` — Mode : *{mode}*")
+            return "\n".join(lines)
+
+        # Outils de la version de référence
+        ref_tools_res = await db.execute(
+            select(PluginVersionTool).where(PluginVersionTool.plugin_version_id == ref_version.id)
+        )
+        ref_tools_list = ref_tools_res.scalars().all()
+        ref_tools_map = {t.item_key: t for t in ref_tools_list}
+        if not ref_tools_map and ref_version.package_data:
+            pkg_tools = (ref_version.package_data or {}).get("tools") or []
+            for pt in pkg_tools:
+                ik = pt.get("item_key") or f"{pt.get('tool_code')}_{pt.get('selected_resource_id') or 0}"
+                ref_tools_map[ik] = pt
+
+        # Comparer les outils
+        added_items = []
+        updated_items = []
+        removed_items = []
+
+        # 1. Détecter ajouts et modifications
+        for k, c_tool in cur_tools_map.items():
+            c_name = getattr(c_tool, "name", None) or (c_tool.get("name") if isinstance(c_tool, dict) else k)
+            c_code = getattr(c_tool, "tool_code", None) or (c_tool.get("tool_code") if isinstance(c_tool, dict) else "")
+            c_mode = getattr(c_tool, "distribution_mode", None) or (c_tool.get("distribution_mode") if isinstance(c_tool, dict) else "tenant")
+            c_perm = getattr(c_tool, "permissions_mode", None) or (c_tool.get("permissions_mode") if isinstance(c_tool, dict) else "restricted")
+            c_params = getattr(c_tool, "parameters", None) or (c_tool.get("parameters") if isinstance(c_tool, dict) else {}) or {}
+            c_ver = (
+                c_params.get("selected_form_version_number")
+                or c_params.get("selected_resource_version_number")
+                or c_params.get("selected_campaign_version_number")
+                or c_params.get("selected_project_version_number")
+                or c_params.get("version")
+            )
+
+            if k not in ref_tools_map:
+                ver_suffix = f" (v{c_ver})" if c_ver else ""
+                added_items.append(f"- **{c_name}**{ver_suffix} `[{c_code}]` — Nouveau module ajouté (Mode : *{c_mode}*, Permissions : *{c_perm}*)")
+            else:
+                r_tool = ref_tools_map[k]
+                r_mode = getattr(r_tool, "distribution_mode", None) or (r_tool.get("distribution_mode") if isinstance(r_tool, dict) else "tenant")
+                r_perm = getattr(r_tool, "permissions_mode", None) or (r_tool.get("permissions_mode") if isinstance(r_tool, dict) else "restricted")
+                r_params = getattr(r_tool, "parameters", None) or (r_tool.get("parameters") if isinstance(r_tool, dict) else {}) or {}
+                r_ver = (
+                    r_params.get("selected_form_version_number")
+                    or r_params.get("selected_resource_version_number")
+                    or r_params.get("selected_campaign_version_number")
+                    or r_params.get("selected_project_version_number")
+                    or r_params.get("version")
+                )
+
+                diffs = []
+                if c_ver and r_ver and str(c_ver) != str(r_ver):
+                    diffs.append(f"version de composant passée de **v{r_ver}** à **v{c_ver}**")
+                elif c_ver and not r_ver:
+                    diffs.append(f"version certifiée fixée à **v{c_ver}**")
+
+                if c_mode != r_mode:
+                    diffs.append(f"mode de distribution modifié de *{r_mode}* à *{c_mode}*")
+                if c_perm != r_perm:
+                    diffs.append(f"permissions modifiées de *{r_perm}* à *{c_perm}*")
+
+                if diffs:
+                    updated_items.append(f"- **{c_name}** `[{c_code}]` : {', '.join(diffs)}")
+
+        # 2. Détecter retraits
+        for k, r_tool in ref_tools_map.items():
+            if k not in cur_tools_map:
+                r_name = getattr(r_tool, "name", None) or (r_tool.get("name") if isinstance(r_tool, dict) else k)
+                r_code = getattr(r_tool, "tool_code", None) or (r_tool.get("tool_code") if isinstance(r_tool, dict) else "")
+                removed_items.append(f"- **{r_name}** `[{r_code}]` (retiré du package)")
+
+        # Assembler le rapport
+        lines = [
+            f"### 📋 Notes de version v{current_version.version_number}",
+            f"*Comparaison automatique avec la version précédente (v{ref_version.version_number}) :*",
+            "",
+        ]
+
+        has_any_change = False
+        if added_items:
+            has_any_change = True
+            lines.append("#### ✨ Nouveaux Modules & Fonctionnalités Ajoutés :")
+            lines.extend(added_items)
+            lines.append("")
+
+        if updated_items:
+            has_any_change = True
+            lines.append("#### ⟳ Évolutions & Mises à Jour de Modules :")
+            lines.extend(updated_items)
+            lines.append("")
+
+        if removed_items:
+            has_any_change = True
+            lines.append("#### 🗑️ Modules Retirés :")
+            lines.extend(removed_items)
+            lines.append("")
+
+        if not has_any_change:
+            lines.append(f"✓ Maintenance générale de compatibilité, optimisations internes et vérifications de conformité pour la version v{current_version.version_number}.")
+
+        return "\n".join(lines).strip()
+
     async def publish_version(
         self,
         db: AsyncSession,
@@ -815,28 +993,11 @@ class PluginService:
                 detail="Impossible de publier : vous devez ajouter au moins un module ou une fonctionnalité à cette version avant de la publier."
             )
 
-        # Règle 8 : Vérifier le détail du contenu / changelog
-        res_count = await db.execute(
-            select(func.count(PluginVersion.id)).where(
-                PluginVersion.plugin_id == plugin_id,
-                PluginVersion.status == PluginVersionStatus.PUBLISHED.value
-            )
-        )
-        published_count = res_count.scalar() or 0
-
+        # Règle 8 & Auto-Diff : Si l'utilisateur n'a pas rédigé de notes manuellement,
+        # le système calcule lui-même et génère la comparaison exhaustive avec la version précédente.
         final_changelog = details_or_changelog or version.changelog
-        if published_count == 0:
-            if not final_changelog or len(final_changelog.strip()) < 15:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Pour la première version du plugin, vous devez obligatoirement détailler avec précision l'ensemble des éléments inclus (modèles de projets, formulaires de collecte, connecteurs)."
-                )
-        else:
-            if not final_changelog or len(final_changelog.strip()) < 15:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Pour publier une nouvelle version, vous devez obligatoirement détailler les nouveautés, correctifs et changements dans les notes de version."
-                )
+        if not final_changelog or len(final_changelog.strip()) < 10:
+            final_changelog = await self.generate_version_diff(db, plugin, version)
 
         version.changelog = final_changelog.strip()
 
@@ -859,30 +1020,69 @@ class PluginService:
         if plugin.status == PluginStatus.DRAFT.value:
             plugin.status = PluginStatus.PUBLISHED.value
 
-        # 2. Identifier les organisations clientes (temporairement vide)
-        subscribers = []
-
-        # 3. Dispatch des notifications in-app aux administrateurs (Règle 5)
-        notified_owners = set()
-        for inst in subscribers:
-            org = getattr(inst, "organization", None)
-            owner_id = getattr(org, "owner_id", None) if org else None
-            if owner_id and owner_id not in notified_owners:
-                notified_owners.add(owner_id)
-
-        for owner_id in notified_owners:
-            await notification_service.create_notification(
-                db=db,
-                user_id=owner_id,
-                title=f"Mise à jour disponible : {plugin.name} v{version.version_number}",
-                message=(
-                    f"Une nouvelle version {version.version_number} du plugin '{plugin.name}' est disponible "
-                    f"sur le SenWiseStore avec de nouveaux ajouts. Consultez le changelog et mettez à jour votre espace."
-                ),
-                link=f"/dashboard/marketplace/{plugin.code}",
-                type="info",
-                commit=False
+        # 2. Identifier toutes les organisations clientes ayant installé/utilisant ce plugin (Règle 5)
+        notified_user_ids = set()
+        try:
+            op_res = await db.execute(
+                select(OrganizationPlugin).where(
+                    OrganizationPlugin.source_plugin_id == plugin.id,
+                    OrganizationPlugin.status != "uninstalled"
+                )
             )
+            org_plugins = op_res.scalars().all()
+
+            for op in org_plugins:
+                # Utilisateurs directs enregistrés sur l'instance locale
+                for uid in (op.user_ids or []):
+                    if isinstance(uid, int):
+                        notified_user_ids.add(uid)
+                    elif isinstance(uid, str) and uid.isdigit():
+                        notified_user_ids.add(int(uid))
+
+                # Organisations clientes associées
+                for org_id in (op.organization_ids or []):
+                    if not org_id:
+                        continue
+                    oid = int(org_id) if str(org_id).isdigit() else None
+                    if oid:
+                        # Propriétaire de l'organisation
+                        org_res = await db.execute(select(Organization).where(Organization.id == oid))
+                        org_obj = org_res.scalars().first()
+                        if org_obj and org_obj.owner_id:
+                            notified_user_ids.add(org_obj.owner_id)
+
+                        # Administrateurs et membres actifs de l'organisation
+                        users_res = await db.execute(
+                            select(User.id).where(
+                                User.organization_id == oid,
+                                User.status == "active"
+                            )
+                        )
+                        for u_row in users_res.fetchall():
+                            notified_user_ids.add(u_row[0])
+        except Exception as scan_err:
+            logger.warning(f"Avertissement lors de la collecte des abonnés du plugin {plugin.id}: {scan_err}")
+
+        # 3. Dispatch des notifications in-app aux administrateurs et utilisateurs (Règle 5)
+        for target_uid in notified_user_ids:
+            if target_uid == publisher_user.id:
+                continue
+            try:
+                await notification_service.create_notification(
+                    db=db,
+                    user_id=target_uid,
+                    title=f"Mise à jour disponible : {plugin.name} v{version.version_number}",
+                    message=(
+                        f"Une nouvelle version v{version.version_number} du plugin « {plugin.name} » est disponible "
+                        f"sur le SenWiseStore avec de nouvelles fonctionnalités et mises à jour de modules. "
+                        f"Consultez les changements et mettez à niveau votre espace."
+                    ),
+                    link=f"/dashboard/marketplace?plugin={plugin.code}",
+                    type="info",
+                    commit=False
+                )
+            except Exception as notif_err:
+                logger.warning(f"Erreur d'envoi de notification pour l'utilisateur {target_uid}: {notif_err}")
 
         await db.commit()
         fresh_version = await self.get_version_by_id(db, plugin_id, version_id)

@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.database import get_db
-from app.api.deps import require_super_admin
+from app.api.deps import require_super_admin, get_current_user
 from app.models.user.user import User
 from app.models.plugin.plugin import PluginVersionStatus, PluginStatus
 from app.schemas.plugin.plugin import (
@@ -302,6 +302,47 @@ async def publish_plugin_version(
         usage_policy=payload.usage_policy if payload else None,
     )
     return _format_version_obj(version)
+
+
+@router.get("/{plugin_id}/versions/{version_id}/diff")
+async def get_plugin_version_diff(
+    plugin_id: int,
+    version_id: int,
+    base_version_id: Optional[int] = Query(None, description="ID de la version de référence pour la comparaison"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    [Connecté / Admin] Calcule et renvoie la comparaison automatique (diff)
+    entre une version de plugin et une version de base/précédente.
+    """
+    plugin = await plugin_service.get_by_id(db, plugin_id)
+    if not plugin:
+        raise HTTPException(status_code=404, detail="Plugin introuvable.")
+
+    current_version = await plugin_service.get_version_by_id(db, plugin_id, version_id)
+    if not current_version:
+        raise HTTPException(status_code=404, detail="Version cible introuvable.")
+
+    base_version = None
+    if base_version_id:
+        base_version = await plugin_service.get_version_by_id(db, plugin_id, base_version_id)
+
+    diff_markdown = await plugin_service.generate_version_diff(
+        db=db,
+        plugin=plugin,
+        current_version=current_version,
+        base_version=base_version,
+    )
+
+    return {
+        "plugin_id": plugin_id,
+        "version_id": version_id,
+        "version_number": current_version.version_number,
+        "base_version_id": base_version.id if base_version else None,
+        "base_version_number": base_version.version_number if base_version else None,
+        "diff_markdown": diff_markdown,
+    }
 
 
 @router.delete("/{plugin_id}/versions/{version_id}")
