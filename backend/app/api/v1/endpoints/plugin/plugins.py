@@ -21,7 +21,7 @@ from app.schemas.plugin.plugin import (
     PluginVersionToolUpdate,
     PluginVersionToolResponse,
 )
-from app.services.plugin.plugin_service import plugin_service
+from app.services.plugin.plugin_service import plugin_service, version_sort_key
 from app.services.plugin.tool_registry import get_tool_catalog
 
 
@@ -98,7 +98,7 @@ def _format_plugin_response(plug) -> dict:
     installations_list = p_dict.get("installations") if isinstance(p_dict, dict) and "installations" in p_dict else []
 
     pub_versions = [v for v in versions_list if getattr(v, "status", "") == PluginVersionStatus.PUBLISHED.value]
-    pub_versions.sort(key=lambda x: (getattr(x, "id", 0) or 0), reverse=True)
+    pub_versions.sort(key=version_sort_key, reverse=True)
     latest_version = pub_versions[0] if pub_versions else (versions_list[0] if versions_list else None)
     oldest_published_version = pub_versions[-1] if pub_versions else None
 

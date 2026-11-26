@@ -1,5 +1,6 @@
 import copy
 import uuid
+import re
 from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime, timezone, timedelta
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -7,6 +8,21 @@ from sqlalchemy import select, update, delete, desc, func, or_, and_
 from sqlalchemy.orm import selectinload
 from sqlalchemy.orm.attributes import flag_modified
 from fastapi import HTTPException, status
+
+
+def parse_version_tuple(v_str: Optional[str]) -> Tuple[int, ...]:
+    """Extrait un tuple numérique de version (ex: '1.10.2' -> (1, 10, 2)) pour tri SemVer robuste."""
+    if not v_str:
+        return (0, 0, 0)
+    nums = re.findall(r"\d+", str(v_str))
+    return tuple(int(n) for n in nums) if nums else (0, 0, 0)
+
+
+def version_sort_key(v: Any) -> Tuple[Tuple[int, ...], int]:
+    """Clé de tri stricte par version sémantique (majeure, mineure, patch), avec tiebreaker ID."""
+    v_num = getattr(v, "version_number", None) or (v.get("version_number") if isinstance(v, dict) else "")
+    v_id = getattr(v, "id", None) or (v.get("id") if isinstance(v, dict) else 0) or 0
+    return (parse_version_tuple(v_num), v_id)
 
 from app.models.plugin.plugin import (
     Plugin,
@@ -1284,7 +1300,7 @@ class PluginService:
                 continue
 
             # La dernière version publiée
-            pub_versions.sort(key=lambda x: (x.id or 0), reverse=True)
+            pub_versions.sort(key=version_sort_key, reverse=True)
             latest_version = pub_versions[0]
 
             org_plug = org_plugins_by_source_id.get(plug.id)
@@ -1294,7 +1310,7 @@ class PluginService:
 
             if is_installed and org_plug:
                 user_opvs = org_plugin_versions_by_plugin_id.get(org_plug.id, [])
-                user_opvs.sort(key=lambda x: (x.id or 0), reverse=True)
+                user_opvs.sort(key=version_sort_key, reverse=True)
                 installed_opv = user_opvs[0] if user_opvs else None
                 source_installed_ver = next((v for v in pub_versions if installed_opv and v.id == installed_opv.source_plugin_version_id), None)
 
@@ -1359,7 +1375,7 @@ class PluginService:
                 detail="Aucune version publiée n'est disponible pour ce plugin."
             )
 
-        pub_versions.sort(key=lambda x: (x.id or 0), reverse=True)
+        pub_versions.sort(key=version_sort_key, reverse=True)
         latest_version = pub_versions[0]
 
         is_installed = False
@@ -1520,19 +1536,32 @@ class PluginService:
                     detail="Ce plugin est privé et son intégration n'est pas autorisée pour votre organisation."
                 )
 
-        # 3. Résolution de la version cible
-        if version_id:
+        # 3. Résolution de la version cible :
+        # RÈGLE D'OR : Quand une organisation télécharge un plugin avec plusieurs versions,
+        # c'est la version la plus récente qui se télécharge systématiquement.
+        pub_versions = [v for v in plugin.versions if v.status in (PluginVersionStatus.PUBLISHED.value, "published")]
+        if not pub_versions:
+            raise HTTPException(status_code=400, detail="Aucune version publiée disponible pour ce plugin.")
+        pub_versions.sort(key=version_sort_key, reverse=True)
+        latest_version = pub_versions[0]
+
+        # Vérifier si l'organisation possède déjà ce plugin
+        op_check = await db.execute(
+            select(OrganizationPlugin).where(OrganizationPlugin.source_plugin_id == plugin.id)
+        )
+        existing_op = op_check.scalars().first()
+        is_already_installed = existing_op and org_id in (existing_op.organization_ids or [])
+
+        # Si l'organisation n'a pas encore ce plugin (premier téléchargement),
+        # ou si version_id n'est pas spécifié, la version la plus récente prévaut.
+        if not is_already_installed or not version_id:
+            version = latest_version
+        else:
             version = await self.get_version_by_id(db, plugin_id, version_id)
             if not version or version.plugin_id != plugin.id:
                 raise HTTPException(status_code=404, detail="Version spécifiée introuvable pour ce plugin.")
             if version.status not in (PluginVersionStatus.PUBLISHED.value, "published"):
                 raise HTTPException(status_code=400, detail="Impossible d'installer une version non publiée.")
-        else:
-            pub_versions = [v for v in plugin.versions if v.status == PluginVersionStatus.PUBLISHED.value]
-            if not pub_versions:
-                raise HTTPException(status_code=400, detail="Aucune version publiée disponible pour ce plugin.")
-            pub_versions.sort(key=lambda x: (x.id or 0), reverse=True)
-            version = pub_versions[0]
 
         if getattr(version, "is_blocked", False):
             raise HTTPException(
@@ -1764,16 +1793,16 @@ class PluginService:
         if not plugin:
             raise HTTPException(status_code=404, detail="Plugin introuvable.")
 
-        if target_version_id:
-            new_version = await self.get_version_by_id(db, plugin_id, target_version_id)
-            if not new_version or new_version.plugin_id != plugin.id:
-                raise HTTPException(status_code=404, detail="Version cible spécifiée introuvable.")
-        else:
-            pub_versions = [v for v in plugin.versions if v.status == PluginVersionStatus.PUBLISHED.value]
-            pub_versions.sort(key=lambda x: (x.id or 0), reverse=True)
-            if not pub_versions:
-                raise HTTPException(status_code=400, detail="Aucune version publiée disponible pour mise à niveau.")
-            new_version = pub_versions[0]
+        # RÈGLE D'OR : Lors de la mise à jour d'un plugin, c'est la version la plus récente
+        # qui est systématiquement téléchargée et appliquée.
+        pub_versions = [v for v in plugin.versions if v.status in (PluginVersionStatus.PUBLISHED.value, "published")]
+        if not pub_versions:
+            raise HTTPException(status_code=400, detail="Aucune version publiée disponible pour mise à niveau.")
+        pub_versions.sort(key=version_sort_key, reverse=True)
+        latest_version = pub_versions[0]
+
+        # La cible de mise à niveau est systématiquement la version la plus récente
+        new_version = latest_version
 
         res = await self.install_plugin_for_org(
             db=db,
@@ -2943,7 +2972,7 @@ class PluginService:
         for op in installed_ops:
             # Identifier la version téléchargée pour cette organisation
             user_opvs = org_plugin_versions_by_plugin_id.get(op.id, [])
-            user_opvs.sort(key=lambda x: (x.id or 0), reverse=True)
+            user_opvs.sort(key=version_sort_key, reverse=True)
             installed_opv = user_opvs[0] if user_opvs else None
 
             # Identifier la dernière version publiée depuis source_plugin
@@ -2951,7 +2980,7 @@ class PluginService:
             latest_version = None
             if source_plugin:
                 pub_v = [v for v in (source_plugin.versions or []) if v.status == PluginVersionStatus.PUBLISHED.value]
-                pub_v.sort(key=lambda x: (x.id or 0), reverse=True)
+                pub_v.sort(key=version_sort_key, reverse=True)
                 latest_version = pub_v[0] if pub_v else None
 
             has_update = bool(
