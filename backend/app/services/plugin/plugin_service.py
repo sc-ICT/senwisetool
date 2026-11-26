@@ -1968,6 +1968,11 @@ class PluginService:
                 reused_rv = (await db.execute(prev_rv_stmt)).scalars().first()
 
             if reused_rv:
+                # S'assurer que cover_image_url et icon sont bien synchronisés sur la ressource existante
+                ores = await db.get(OrganizationResource, reused_rv.organization_resource_id)
+                if ores and source_res.cover_image_url and ores.cover_image_url != source_res.cover_image_url:
+                    ores.cover_image_url = source_res.cover_image_url
+                    await db.flush()
                 # Réutilisation directe sans re-téléchargement ni recréation des items
                 res_source_to_local[source_res.id] = reused_rv.organization_resource_id
                 res_ver_source_to_local[source_rv.id] = reused_rv.id
@@ -2014,6 +2019,10 @@ class PluginService:
                 org_res.schema_fields = source_res.schema_fields or org_res.schema_fields
                 org_res.settings = t_params
                 org_res.parameters = t_params
+                if source_res.cover_image_url:
+                    org_res.cover_image_url = source_res.cover_image_url
+                if source_res.icon:
+                    org_res.icon = source_res.icon
                 flag_modified(org_res, "settings")
                 flag_modified(org_res, "parameters")
                 await db.flush()
@@ -2431,6 +2440,8 @@ class PluginService:
                 org_proj.name = tool.get("selected_resource_name") or source_proj.name
                 org_proj.settings = t_params
                 org_proj.parameters = t_params
+                if source_proj.cover_image_url:
+                    org_proj.cover_image_url = source_proj.cover_image_url
                 flag_modified(org_proj, "settings")
                 flag_modified(org_proj, "parameters")
                 await db.flush()

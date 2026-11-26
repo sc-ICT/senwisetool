@@ -1161,6 +1161,7 @@ async def get_workspace_summary(
                 "status": r.status,
                 "version": r.version,
                 "icon": r.icon,
+                "cover_image_url": r.cover_image_url,
                 "metrics": r.metrics or {},
                 "parameters": r.parameters or {},
                 "settings": r.settings or {},
@@ -1393,6 +1394,7 @@ async def get_workspace_feature(
                 "status": r.status,
                 "version": r.version,
                 "icon": r.icon,
+                "cover_image_url": r.cover_image_url,
                 "metrics": r.metrics or {},
                 "parameters": r.parameters or {},
                 "settings": r.settings or {},
@@ -1547,6 +1549,15 @@ async def get_workspace_resource_detail(
 
     effective_schema = target_ver.schema_fields if target_ver and target_ver.schema_fields else (res.schema_fields or [])
 
+    # Récupérer cover_image_url depuis res ou sa ressource source
+    cover_image = res.cover_image_url
+    if not cover_image and res.source_resource_id:
+        src_r = await db.get(Resource, res.source_resource_id)
+        if src_r and src_r.cover_image_url:
+            cover_image = src_r.cover_image_url
+            res.cover_image_url = cover_image
+            await db.commit()
+
     return {
         "resource": {
             "id": res.id,
@@ -1557,6 +1568,7 @@ async def get_workspace_resource_detail(
             "category": res.category,
             "visibility": res.visibility,
             "icon": res.icon,
+            "cover_image_url": cover_image,
             "status": res.status,
             "version": res.version,
             "scope": res.scope,
