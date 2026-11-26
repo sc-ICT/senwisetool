@@ -1825,6 +1825,86 @@ class PluginService:
 
         return res
 
+    @staticmethod
+    def _build_effective_governance(
+        tool: Dict[str, Any],
+        tool_params: Dict[str, Any],
+        source_ver_gov: Optional[Dict[str, Any]] = None,
+        default_creation: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Garantit que l'ensemble des règles de gouvernance, configurations,
+        paramètres et permissions configurés dans la version du plugin pour un module
+        sont fidèlement fusionnés et consolidés.
+        """
+        perms_mode = tool.get("permissions_mode") or tool_params.get("permissions_mode") or "restricted"
+        dist_mode = tool.get("distribution_mode") or tool_params.get("distribution_mode") or "tenant"
+
+        gov = dict(source_ver_gov or {})
+
+        allow_creation = tool_params.get("allow_creation", tool.get("allow_creation", default_creation))
+        allow_data_addition = tool_params.get("allow_data_addition", tool.get("allow_data_addition", True))
+        allow_add_records = tool_params.get("allow_add_records", allow_data_addition)
+
+        allow_data_update = tool_params.get("allow_data_update", tool.get("allow_data_update", True))
+        allow_edit_records = tool_params.get("allow_edit_records", allow_data_update)
+        allow_edit = tool_params.get("allow_edit", allow_data_update)
+
+        allow_data_deletion = tool_params.get("allow_data_deletion", tool.get("allow_data_deletion", False))
+        allow_delete_records = tool_params.get("allow_delete_records", allow_data_deletion)
+        allow_resource_deletion = tool_params.get("allow_resource_deletion", tool.get("allow_resource_deletion", False))
+
+        allow_schema = tool_params.get("allow_schema_modification", tool.get("allow_schema_modification", False))
+        allow_edit_schema = tool_params.get("allow_edit_schema", allow_schema)
+
+        allow_export = tool_params.get("allow_export", tool.get("allow_export", True))
+        allow_import = tool_params.get("allow_import", tool.get("allow_import", False))
+        allow_archive = tool_params.get("allow_archive", tool.get("allow_archive", True))
+
+        is_immutable = tool_params.get("is_immutable", tool.get("is_immutable", False))
+        immutable_fields = tool_params.get("immutable_fields", tool.get("immutable_fields", []))
+        mandatory_fields = tool_params.get("mandatory_fields", tool.get("mandatory_fields", []))
+
+        locked_rows_mode = tool_params.get("locked_rows_mode", "all_initial")
+        mandatory_row_keys = tool_params.get("mandatory_row_keys", [])
+        editable_rows_mode = tool_params.get("editable_rows_mode", "all")
+        editable_row_keys = tool_params.get("editable_row_keys", [])
+        deletable_rows_mode = tool_params.get("deletable_rows_mode", "all")
+        deletable_row_keys = tool_params.get("deletable_row_keys", [])
+
+        gov.update({
+            "permissions_mode": perms_mode,
+            "distribution_mode": dist_mode,
+            "allow_creation": allow_creation,
+            "allow_data_addition": allow_data_addition,
+            "allow_add_records": allow_add_records,
+            "allow_data_update": allow_data_update,
+            "allow_edit_records": allow_edit_records,
+            "allow_edit": allow_edit,
+            "allow_data_deletion": allow_data_deletion,
+            "allow_delete_records": allow_delete_records,
+            "allow_resource_deletion": allow_resource_deletion,
+            "allow_schema_modification": allow_schema,
+            "allow_edit_schema": allow_edit_schema,
+            "allow_export": allow_export,
+            "allow_import": allow_import,
+            "allow_archive": allow_archive,
+            "is_immutable": is_immutable,
+            "immutable_fields": immutable_fields,
+            "mandatory_fields": mandatory_fields,
+            "locked_rows_mode": locked_rows_mode,
+            "mandatory_row_keys": mandatory_row_keys,
+            "editable_rows_mode": editable_rows_mode,
+            "editable_row_keys": editable_row_keys,
+            "deletable_rows_mode": deletable_rows_mode,
+            "deletable_row_keys": deletable_row_keys,
+        })
+
+        if isinstance(tool_params.get("template_governance"), dict):
+            gov.update(tool_params["template_governance"])
+
+        return gov
+
     async def _provision_embedded_elements(
         self,
         db: AsyncSession,
@@ -1948,6 +2028,13 @@ class PluginService:
                 ).order_by(desc(ResourceVersion.id))
                 source_rv = (await db.execute(pub_rv_stmt)).scalars().first()
 
+            # Consolidation stricte de la gouvernance, paramètres et permissions de la version embarquée
+            gov_res = self._build_effective_governance(
+                tool=tool,
+                tool_params=t_params,
+                source_ver_gov=source_rv.template_governance if source_rv else None
+            )
+
             # RÈGLE D'OPTIMISATION MAJEURE (Multi-Tenant & Inter-Version) :
             # Si cette version spécifique du module a déjà été téléchargée par cette organisation
             # pour une autre version du MÊME plugin, réutiliser ce qui est déjà téléchargé.
@@ -1968,11 +2055,45 @@ class PluginService:
                 reused_rv = (await db.execute(prev_rv_stmt)).scalars().first()
 
             if reused_rv:
-                # S'assurer que cover_image_url et icon sont bien synchronisés sur la ressource existante
+                # Synchroniser cover_image_url, icon, gouvernance, paramètres et permissions sur la ressource existante
                 ores = await db.get(OrganizationResource, reused_rv.organization_resource_id)
-                if ores and source_res.cover_image_url and ores.cover_image_url != source_res.cover_image_url:
-                    ores.cover_image_url = source_res.cover_image_url
+                if ores:
+                    if source_res.cover_image_url and ores.cover_image_url != source_res.cover_image_url:
+                        ores.cover_image_url = source_res.cover_image_url
+                    if source_res.icon and ores.icon != source_res.icon:
+                        ores.icon = source_res.icon
+                    ores.is_immutable = gov_res.get("is_immutable", False)
+                    ores.immutable_fields = gov_res.get("immutable_fields", [])
+                    ores_params = dict(ores.parameters or {})
+                    ores_params.update(t_params)
+                    ores_params["template_governance"] = gov_res
+                    ores_params["permissions_mode"] = gov_res["permissions_mode"]
+                    ores.parameters = ores_params
+                    ores_settings = dict(ores.settings or {})
+                    ores_settings.update(t_params)
+                    ores_settings["template_governance"] = gov_res
+                    ores_settings["permissions_mode"] = gov_res["permissions_mode"]
+                    ores.settings = ores_settings
+                    flag_modified(ores, "parameters")
+                    flag_modified(ores, "settings")
                     await db.flush()
+
+                reused_rv.template_governance = gov_res
+                rv_params = dict(reused_rv.parameters or {})
+                rv_params.update(t_params)
+                rv_params["template_governance"] = gov_res
+                rv_params["permissions_mode"] = gov_res["permissions_mode"]
+                reused_rv.parameters = rv_params
+                rv_settings = dict(reused_rv.settings or {})
+                rv_settings.update(t_params)
+                rv_settings["template_governance"] = gov_res
+                rv_settings["permissions_mode"] = gov_res["permissions_mode"]
+                reused_rv.settings = rv_settings
+                flag_modified(reused_rv, "template_governance")
+                flag_modified(reused_rv, "parameters")
+                flag_modified(reused_rv, "settings")
+                await db.flush()
+
                 # Réutilisation directe sans re-téléchargement ni recréation des items
                 res_source_to_local[source_res.id] = reused_rv.organization_resource_id
                 res_ver_source_to_local[source_rv.id] = reused_rv.id
@@ -1984,6 +2105,9 @@ class PluginService:
                 OrganizationResource.source_resource_id == source_res.id
             )
             org_res = (await db.execute(ores_stmt)).scalars().first()
+
+            merged_res_params = {**t_params, "template_governance": gov_res, "permissions_mode": gov_res["permissions_mode"]}
+            merged_res_settings = {**(source_res.settings or {}), **t_params, "template_governance": gov_res, "permissions_mode": gov_res["permissions_mode"]}
 
             if not org_res:
                 org_res = OrganizationResource(
@@ -2002,14 +2126,14 @@ class PluginService:
                     version=source_res.version or "1.0.0",
                     scope=source_res.scope or "organization",
                     is_shared=source_res.is_shared if hasattr(source_res, "is_shared") else False,
-                    is_immutable=source_res.is_immutable if hasattr(source_res, "is_immutable") else False,
-                    immutable_fields=source_res.immutable_fields or [],
+                    is_immutable=gov_res.get("is_immutable", False),
+                    immutable_fields=gov_res.get("immutable_fields", []),
                     is_lts=source_res.is_lts if hasattr(source_res, "is_lts") else False,
                     schema_history=source_res.schema_history or [],
                     description=source_res.description or "",
                     schema_fields=source_res.schema_fields or [],
-                    settings=t_params,
-                    parameters=t_params,
+                    settings=merged_res_settings,
+                    parameters=merged_res_params,
                     metrics=source_res.metrics or {},
                 )
                 db.add(org_res)
@@ -2017,8 +2141,10 @@ class PluginService:
             else:
                 org_res.name = tool.get("selected_resource_name") or source_res.name
                 org_res.schema_fields = source_res.schema_fields or org_res.schema_fields
-                org_res.settings = t_params
-                org_res.parameters = t_params
+                org_res.is_immutable = gov_res.get("is_immutable", False)
+                org_res.immutable_fields = gov_res.get("immutable_fields", [])
+                org_res.settings = merged_res_settings
+                org_res.parameters = merged_res_params
                 if source_res.cover_image_url:
                     org_res.cover_image_url = source_res.cover_image_url
                 if source_res.icon:
@@ -2037,6 +2163,9 @@ class PluginService:
                 )
                 org_rv = (await db.execute(orv_stmt)).scalars().first()
 
+                merged_rv_params = {**t_params, "template_governance": gov_res, "permissions_mode": gov_res["permissions_mode"]}
+                merged_rv_settings = {**(source_rv.settings or {}), **t_params, "template_governance": gov_res, "permissions_mode": gov_res["permissions_mode"]}
+
                 if not org_rv:
                     org_rv = OrganizationResourceVersion(
                         organization_resource_id=org_res.id,
@@ -2050,16 +2179,18 @@ class PluginService:
                         changelog=source_rv.changelog or "",
                         schema_fields=source_rv.schema_fields or [],
                         metrics=source_rv.metrics or {},
-                        template_governance=source_rv.template_governance or {},
-                        settings={**(source_rv.settings or {}), **t_params},
-                        parameters={**(source_rv.settings or {}), **t_params},
+                        template_governance=gov_res,
+                        settings=merged_rv_settings,
+                        parameters=merged_rv_params,
                     )
                     db.add(org_rv)
                     await db.flush()
                 else:
                     org_rv.schema_fields = source_rv.schema_fields or org_rv.schema_fields
-                    org_rv.settings = t_params
-                    org_rv.parameters = t_params
+                    org_rv.template_governance = gov_res
+                    org_rv.settings = merged_rv_settings
+                    org_rv.parameters = merged_rv_params
+                    flag_modified(org_rv, "template_governance")
                     flag_modified(org_rv, "settings")
                     flag_modified(org_rv, "parameters")
                     await db.flush()
@@ -2109,6 +2240,81 @@ class PluginService:
 
             t_params = tool.get("parameters") or {}
 
+            # Version de formulaire (OrganizationFormVersion)
+            fv_id = tool.get("selected_form_version_id") or t_params.get("selected_form_version_id")
+            source_fv = None
+            if fv_id:
+                source_fv = await db.get(FormVersion, int(fv_id))
+            if not source_fv:
+                pub_fv_stmt = select(FormVersion).where(
+                    FormVersion.form_id == source_form.id,
+                    FormVersion.status.in_(("published", "active"))
+                ).order_by(desc(FormVersion.id))
+                source_fv = (await db.execute(pub_fv_stmt)).scalars().first()
+
+            gov_frm = self._build_effective_governance(
+                tool=tool,
+                tool_params=t_params,
+                source_ver_gov=source_fv.template_governance if source_fv else None
+            )
+
+            # RÈGLE D'OPTIMISATION MAJEURE (Formulaires) :
+            # Si cette version spécifique du formulaire a déjà été téléchargée par cette organisation
+            # pour une autre version du MÊME plugin, réutiliser ce qui est déjà téléchargé là.
+            reused_fv = None
+            if source_fv:
+                prev_fv_stmt = (
+                    select(OrganizationFormVersion)
+                    .join(
+                        OrganizationPluginVersion,
+                        OrganizationFormVersion.organization_plugin_version_id == OrganizationPluginVersion.id
+                    )
+                    .where(
+                        OrganizationFormVersion.organization_id == org_id,
+                        OrganizationFormVersion.source_form_version_id == source_fv.id,
+                        OrganizationPluginVersion.organization_plugin_id == org_plug.id
+                    )
+                )
+                reused_fv = (await db.execute(prev_fv_stmt)).scalars().first()
+
+            if reused_fv:
+                # Synchroniser la gouvernance, paramètres et permissions sur la version et le formulaire existant
+                reused_fv.template_governance = gov_frm
+                fv_params = dict(reused_fv.parameters or {})
+                fv_params.update(t_params)
+                fv_params["template_governance"] = gov_frm
+                fv_params["permissions_mode"] = gov_frm["permissions_mode"]
+                reused_fv.parameters = fv_params
+                fv_settings = dict(reused_fv.settings or {})
+                fv_settings.update(t_params)
+                fv_settings["template_governance"] = gov_frm
+                fv_settings["permissions_mode"] = gov_frm["permissions_mode"]
+                reused_fv.settings = fv_settings
+                flag_modified(reused_fv, "template_governance")
+                flag_modified(reused_fv, "parameters")
+                flag_modified(reused_fv, "settings")
+
+                o_frm_parent = await db.get(OrganizationForm, reused_fv.organization_form_id)
+                if o_frm_parent:
+                    o_frm_params = dict(o_frm_parent.parameters or {})
+                    o_frm_params.update(t_params)
+                    o_frm_params["template_governance"] = gov_frm
+                    o_frm_params["permissions_mode"] = gov_frm["permissions_mode"]
+                    o_frm_parent.parameters = o_frm_params
+                    o_frm_settings = dict(o_frm_parent.settings or {})
+                    o_frm_settings.update(t_params)
+                    o_frm_settings["template_governance"] = gov_frm
+                    o_frm_settings["permissions_mode"] = gov_frm["permissions_mode"]
+                    o_frm_parent.settings = o_frm_settings
+                    flag_modified(o_frm_parent, "parameters")
+                    flag_modified(o_frm_parent, "settings")
+                await db.flush()
+
+                # Réutilisation directe sans recréation des sections ni des questions
+                form_source_to_local[source_form.id] = reused_fv.organization_form_id
+                form_ver_source_to_local[source_fv.id] = reused_fv.id
+                continue
+
             # Recherche ou création de OrganizationForm
             oform_stmt = select(OrganizationForm).where(
                 OrganizationForm.organization_id == org_id,
@@ -2116,7 +2322,12 @@ class PluginService:
             )
             org_form = (await db.execute(oform_stmt)).scalars().first()
 
-            merged_form_settings = {**(source_form.settings or {}), **t_params}
+            merged_form_settings = {
+                **(source_form.settings or {}),
+                **t_params,
+                "template_governance": gov_frm,
+                "permissions_mode": gov_frm["permissions_mode"]
+            }
             if not org_form:
                 org_form = OrganizationForm(
                     source_form_id=source_form.id,
@@ -2144,43 +2355,6 @@ class PluginService:
 
             form_source_to_local[source_form.id] = org_form.id
 
-            # Version de formulaire (OrganizationFormVersion)
-            fv_id = tool.get("selected_form_version_id") or t_params.get("selected_form_version_id")
-            source_fv = None
-            if fv_id:
-                source_fv = await db.get(FormVersion, int(fv_id))
-            if not source_fv:
-                pub_fv_stmt = select(FormVersion).where(
-                    FormVersion.form_id == source_form.id,
-                    FormVersion.status.in_(("published", "active"))
-                ).order_by(desc(FormVersion.id))
-                source_fv = (await db.execute(pub_fv_stmt)).scalars().first()
-
-            # RÈGLE D'OPTIMISATION MAJEURE (Formulaires) :
-            # Si cette version spécifique du formulaire a déjà été téléchargée par cette organisation
-            # pour une autre version du MÊME plugin, réutiliser ce qui est déjà téléchargé là.
-            reused_fv = None
-            if source_fv:
-                prev_fv_stmt = (
-                    select(OrganizationFormVersion)
-                    .join(
-                        OrganizationPluginVersion,
-                        OrganizationFormVersion.organization_plugin_version_id == OrganizationPluginVersion.id
-                    )
-                    .where(
-                        OrganizationFormVersion.organization_id == org_id,
-                        OrganizationFormVersion.source_form_version_id == source_fv.id,
-                        OrganizationPluginVersion.organization_plugin_id == org_plug.id
-                    )
-                )
-                reused_fv = (await db.execute(prev_fv_stmt)).scalars().first()
-
-            if reused_fv:
-                # Réutilisation directe sans recréation des sections ni des questions
-                form_source_to_local[source_form.id] = reused_fv.organization_form_id
-                form_ver_source_to_local[source_fv.id] = reused_fv.id
-                continue
-
             if source_fv:
                 ofv_stmt = select(OrganizationFormVersion).where(
                     OrganizationFormVersion.organization_id == org_id,
@@ -2189,7 +2363,13 @@ class PluginService:
                 )
                 org_fv = (await db.execute(ofv_stmt)).scalars().first()
 
-                merged_ver_settings = {**(source_form.settings or {}), **(source_fv.settings or {}), **t_params}
+                merged_ver_settings = {
+                    **(source_form.settings or {}),
+                    **(source_fv.settings or {}),
+                    **t_params,
+                    "template_governance": gov_frm,
+                    "permissions_mode": gov_frm["permissions_mode"]
+                }
                 if not org_fv:
                     org_fv = OrganizationFormVersion(
                         organization_form_id=org_form.id,
@@ -2201,7 +2381,7 @@ class PluginService:
                         status=source_fv.status or "published",
                         description=source_fv.description or "",
                         form_type=source_fv.form_type or "standard",
-                        template_governance=source_fv.template_governance or {},
+                        template_governance=gov_frm,
                         published_at=source_fv.published_at,
                         settings=merged_ver_settings,
                         parameters=merged_ver_settings,
@@ -2212,9 +2392,10 @@ class PluginService:
                     org_fv.version_number = source_fv.version_number
                     org_fv.description = source_fv.description or ""
                     org_fv.form_type = source_fv.form_type or "standard"
-                    org_fv.template_governance = source_fv.template_governance or {}
+                    org_fv.template_governance = gov_frm
                     org_fv.settings = merged_ver_settings
                     org_fv.parameters = merged_ver_settings
+                    flag_modified(org_fv, "template_governance")
                     flag_modified(org_fv, "settings")
                     flag_modified(org_fv, "parameters")
                     await db.flush()
@@ -2410,44 +2591,6 @@ class PluginService:
 
             t_params = tool.get("parameters") or {}
 
-            # Recherche ou création de OrganizationProject
-            oproj_stmt = select(OrganizationProject).where(
-                OrganizationProject.organization_id == org_id,
-                OrganizationProject.source_project_id == source_proj.id
-            )
-            org_proj = (await db.execute(oproj_stmt)).scalars().first()
-
-            if not org_proj:
-                org_proj = OrganizationProject(
-                    source_project_id=source_proj.id,
-                    organization_id=org_id,
-                    organization_plugin_version_id=org_ver.id,
-                    downloaded_by_user_id=user.id,
-                    name=tool.get("selected_resource_name") or source_proj.name,
-                    code=source_proj.code,
-                    project_type=source_proj.project_type or "audit",
-                    category=source_proj.category or "general",
-                    visibility=source_proj.visibility or "private",
-                    authorized_organization_ids=source_proj.authorized_organization_ids or [],
-                    cover_image_url=source_proj.cover_image_url,
-                    status="active",
-                    settings=t_params,
-                    parameters=t_params,
-                )
-                db.add(org_proj)
-                await db.flush()
-            else:
-                org_proj.name = tool.get("selected_resource_name") or source_proj.name
-                org_proj.settings = t_params
-                org_proj.parameters = t_params
-                if source_proj.cover_image_url:
-                    org_proj.cover_image_url = source_proj.cover_image_url
-                flag_modified(org_proj, "settings")
-                flag_modified(org_proj, "parameters")
-                await db.flush()
-
-            proj_source_to_local[source_proj.id] = org_proj.id
-
             # Version de projet (OrganizationProjectVersion)
             pv_id = tool.get("selected_project_version_id") or t_params.get("selected_project_version_id")
             source_pv = None
@@ -2459,6 +2602,12 @@ class PluginService:
                     ProjectVersion.status.in_(("published", "active"))
                 ).order_by(desc(ProjectVersion.id))
                 source_pv = (await db.execute(pub_pv_stmt)).scalars().first()
+
+            gov_proj = self._build_effective_governance(
+                tool=tool,
+                tool_params=t_params,
+                source_ver_gov=source_pv.template_governance if source_pv else None
+            )
 
             # RÈGLE D'OPTIMISATION MAJEURE (Projets) :
             # Si cette version spécifique du projet a déjà été téléchargée par cette organisation
@@ -2480,9 +2629,84 @@ class PluginService:
                 reused_pv = (await db.execute(prev_pv_stmt)).scalars().first()
 
             if reused_pv:
+                reused_pv.template_governance = gov_proj
+                pv_params = dict(reused_pv.parameters or {})
+                pv_params.update(t_params)
+                pv_params["template_governance"] = gov_proj
+                pv_params["permissions_mode"] = gov_proj["permissions_mode"]
+                reused_pv.parameters = pv_params
+                pv_settings = dict(reused_pv.settings or {})
+                pv_settings.update(t_params)
+                pv_settings["template_governance"] = gov_proj
+                pv_settings["permissions_mode"] = gov_proj["permissions_mode"]
+                reused_pv.settings = pv_settings
+                flag_modified(reused_pv, "template_governance")
+                flag_modified(reused_pv, "parameters")
+                flag_modified(reused_pv, "settings")
+
+                o_proj_parent = await db.get(OrganizationProject, reused_pv.organization_project_id)
+                if o_proj_parent:
+                    o_proj_params = dict(o_proj_parent.parameters or {})
+                    o_proj_params.update(t_params)
+                    o_proj_params["template_governance"] = gov_proj
+                    o_proj_params["permissions_mode"] = gov_proj["permissions_mode"]
+                    o_proj_parent.parameters = o_proj_params
+                    o_proj_settings = dict(o_proj_parent.settings or {})
+                    o_proj_settings.update(t_params)
+                    o_proj_settings["template_governance"] = gov_proj
+                    o_proj_settings["permissions_mode"] = gov_proj["permissions_mode"]
+                    o_proj_parent.settings = o_proj_settings
+                    flag_modified(o_proj_parent, "parameters")
+                    flag_modified(o_proj_parent, "settings")
+                await db.flush()
+
                 proj_source_to_local[source_proj.id] = reused_pv.organization_project_id
                 proj_ver_source_to_local[source_pv.id] = reused_pv.id
                 continue
+
+            # Recherche ou création de OrganizationProject
+            oproj_stmt = select(OrganizationProject).where(
+                OrganizationProject.organization_id == org_id,
+                OrganizationProject.source_project_id == source_proj.id
+            )
+            org_proj = (await db.execute(oproj_stmt)).scalars().first()
+
+            merged_proj_parent_params = {
+                **t_params,
+                "template_governance": gov_proj,
+                "permissions_mode": gov_proj["permissions_mode"]
+            }
+
+            if not org_proj:
+                org_proj = OrganizationProject(
+                    source_project_id=source_proj.id,
+                    organization_id=org_id,
+                    organization_plugin_version_id=org_ver.id,
+                    downloaded_by_user_id=user.id,
+                    name=tool.get("selected_resource_name") or source_proj.name,
+                    code=source_proj.code,
+                    project_type=source_proj.project_type or "audit",
+                    category=source_proj.category or "general",
+                    visibility=source_proj.visibility or "private",
+                    authorized_organization_ids=source_proj.authorized_organization_ids or [],
+                    cover_image_url=source_proj.cover_image_url,
+                    status="active",
+                    settings=merged_proj_parent_params,
+                    parameters=merged_proj_parent_params,
+                )
+                db.add(org_proj)
+                await db.flush()
+            else:
+                org_proj.name = tool.get("selected_resource_name") or source_proj.name
+                org_proj.settings = merged_proj_parent_params
+                org_proj.parameters = merged_proj_parent_params
+                if source_proj.cover_image_url:
+                    org_proj.cover_image_url = source_proj.cover_image_url
+                flag_modified(org_proj, "settings")
+                flag_modified(org_proj, "parameters")
+                await db.flush()
+
+            proj_source_to_local[source_proj.id] = org_proj.id
 
             if source_pv:
                 opv_stmt = select(OrganizationProjectVersion).where(
@@ -2492,8 +2716,13 @@ class PluginService:
                 )
                 org_pv = (await db.execute(opv_stmt)).scalars().first()
 
-                merged_proj_settings = {**(source_pv.settings or {}), **(t_params or {})}
-                # Si source_pv a attached_form_versions, s'assurer qu'elles ne sont pas effacées par t_params
+                merged_proj_settings = {
+                    **(source_pv.settings or {}),
+                    **(t_params or {}),
+                    "template_governance": gov_proj,
+                    "permissions_mode": gov_proj["permissions_mode"]
+                }
+                # Préserver attached_form_versions et attached_form_ids
                 if "attached_form_versions" in (source_pv.settings or {}) and "attached_form_versions" not in (t_params or {}):
                     merged_proj_settings["attached_form_versions"] = source_pv.settings["attached_form_versions"]
                 if "attached_form_ids" in (source_pv.settings or {}) and "attached_form_ids" not in (t_params or {}):
@@ -2511,15 +2740,17 @@ class PluginService:
                         description=source_pv.description or "",
                         changelog=source_pv.changelog or "",
                         metrics=source_pv.metrics or {},
-                        template_governance=source_pv.template_governance or {},
+                        template_governance=gov_proj,
                         settings=merged_proj_settings,
                         parameters=merged_proj_settings,
                     )
                     db.add(org_pv)
                     await db.flush()
                 else:
+                    org_pv.template_governance = gov_proj
                     org_pv.settings = merged_proj_settings
                     org_pv.parameters = merged_proj_settings
+                    flag_modified(org_pv, "template_governance")
                     flag_modified(org_pv, "settings")
                     flag_modified(org_pv, "parameters")
                     await db.flush()
@@ -2543,40 +2774,6 @@ class PluginService:
 
             t_params = tool.get("parameters") or {}
 
-            # Recherche ou création de OrganizationCampaign
-            ocamp_stmt = select(OrganizationCampaign).where(
-                OrganizationCampaign.organization_id == org_id,
-                OrganizationCampaign.source_campaign_id == source_camp.id
-            )
-            org_camp = (await db.execute(ocamp_stmt)).scalars().first()
-
-            if not org_camp:
-                org_camp = OrganizationCampaign(
-                    source_campaign_id=source_camp.id,
-                    organization_id=org_id,
-                    organization_plugin_version_id=org_ver.id,
-                    downloaded_by_user_id=user.id,
-                    name=tool.get("selected_resource_name") or source_camp.name,
-                    code=source_camp.code,
-                    description=source_camp.description or "",
-                    visibility=source_camp.visibility or "private",
-                    status=source_camp.status or "active",
-                    version=source_camp.version or "1.0.0",
-                    settings=t_params,
-                    parameters=t_params,
-                )
-                db.add(org_camp)
-                await db.flush()
-            else:
-                org_camp.name = tool.get("selected_resource_name") or source_camp.name
-                org_camp.settings = t_params
-                org_camp.parameters = t_params
-                flag_modified(org_camp, "settings")
-                flag_modified(org_camp, "parameters")
-                await db.flush()
-
-            camp_source_to_local[source_camp.id] = org_camp.id
-
             # Version de campagne (OrganizationCampaignVersion)
             cv_id = tool.get("selected_campaign_version_id") or t_params.get("selected_campaign_version_id")
             source_cv = None
@@ -2588,6 +2785,12 @@ class PluginService:
                     CampaignVersion.status.in_(("published", "open", "active"))
                 ).order_by(desc(CampaignVersion.id))
                 source_cv = (await db.execute(pub_cv_stmt)).scalars().first()
+
+            gov_camp = self._build_effective_governance(
+                tool=tool,
+                tool_params=t_params,
+                source_ver_gov=source_cv.template_governance if source_cv else None
+            )
 
             # RÈGLE D'OPTIMISATION MAJEURE (Campagnes) :
             # Si cette version spécifique de campagne a déjà été téléchargée par cette organisation
@@ -2609,9 +2812,80 @@ class PluginService:
                 reused_cv = (await db.execute(prev_cv_stmt)).scalars().first()
 
             if reused_cv:
+                reused_cv.template_governance = gov_camp
+                cv_params = dict(reused_cv.parameters or {})
+                cv_params.update(t_params)
+                cv_params["template_governance"] = gov_camp
+                cv_params["permissions_mode"] = gov_camp["permissions_mode"]
+                reused_cv.parameters = cv_params
+                cv_settings = dict(reused_cv.settings or {})
+                cv_settings.update(t_params)
+                cv_settings["template_governance"] = gov_camp
+                cv_settings["permissions_mode"] = gov_camp["permissions_mode"]
+                reused_cv.settings = cv_settings
+                flag_modified(reused_cv, "template_governance")
+                flag_modified(reused_cv, "parameters")
+                flag_modified(reused_cv, "settings")
+
+                o_camp_parent = await db.get(OrganizationCampaign, reused_cv.organization_campaign_id)
+                if o_camp_parent:
+                    o_camp_params = dict(o_camp_parent.parameters or {})
+                    o_camp_params.update(t_params)
+                    o_camp_params["template_governance"] = gov_camp
+                    o_camp_params["permissions_mode"] = gov_camp["permissions_mode"]
+                    o_camp_parent.parameters = o_camp_params
+                    o_camp_settings = dict(o_camp_parent.settings or {})
+                    o_camp_settings.update(t_params)
+                    o_camp_settings["template_governance"] = gov_camp
+                    o_camp_settings["permissions_mode"] = gov_camp["permissions_mode"]
+                    o_camp_parent.settings = o_camp_settings
+                    flag_modified(o_camp_parent, "parameters")
+                    flag_modified(o_camp_parent, "settings")
+                await db.flush()
+
                 camp_source_to_local[source_camp.id] = reused_cv.organization_campaign_id
                 camp_ver_source_to_local[source_cv.id] = reused_cv.id
                 continue
+
+            # Recherche ou création de OrganizationCampaign
+            ocamp_stmt = select(OrganizationCampaign).where(
+                OrganizationCampaign.organization_id == org_id,
+                OrganizationCampaign.source_campaign_id == source_camp.id
+            )
+            org_camp = (await db.execute(ocamp_stmt)).scalars().first()
+
+            merged_camp_parent_params = {
+                **t_params,
+                "template_governance": gov_camp,
+                "permissions_mode": gov_camp["permissions_mode"]
+            }
+
+            if not org_camp:
+                org_camp = OrganizationCampaign(
+                    source_campaign_id=source_camp.id,
+                    organization_id=org_id,
+                    organization_plugin_version_id=org_ver.id,
+                    downloaded_by_user_id=user.id,
+                    name=tool.get("selected_resource_name") or source_camp.name,
+                    code=source_camp.code,
+                    description=source_camp.description or "",
+                    visibility=source_camp.visibility or "private",
+                    status=source_camp.status or "active",
+                    version=source_camp.version or "1.0.0",
+                    settings=merged_camp_parent_params,
+                    parameters=merged_camp_parent_params,
+                )
+                db.add(org_camp)
+                await db.flush()
+            else:
+                org_camp.name = tool.get("selected_resource_name") or source_camp.name
+                org_camp.settings = merged_camp_parent_params
+                org_camp.parameters = merged_camp_parent_params
+                flag_modified(org_camp, "settings")
+                flag_modified(org_camp, "parameters")
+                await db.flush()
+
+            camp_source_to_local[source_camp.id] = org_camp.id
 
             if source_cv:
                 ocv_stmt = select(OrganizationCampaignVersion).where(
@@ -2621,7 +2895,12 @@ class PluginService:
                 )
                 org_cv = (await db.execute(ocv_stmt)).scalars().first()
 
-                merged_camp_settings = {**(source_cv.settings or {}), **t_params}
+                merged_camp_settings = {
+                    **(source_cv.settings or {}),
+                    **t_params,
+                    "template_governance": gov_camp,
+                    "permissions_mode": gov_camp["permissions_mode"]
+                }
                 if not org_cv:
                     org_cv = OrganizationCampaignVersion(
                         organization_campaign_id=org_camp.id,
@@ -2642,7 +2921,7 @@ class PluginService:
                         target_projects=source_cv.target_projects or [],
                         changelog=source_cv.changelog or "",
                         metrics=source_cv.metrics or {},
-                        template_governance=source_cv.template_governance or {},
+                        template_governance=gov_camp,
                         settings=merged_camp_settings,
                         parameters=merged_camp_settings,
                     )
@@ -2657,10 +2936,12 @@ class PluginService:
                     org_cv.end_date = source_cv.end_date or org_cv.end_date
                     org_cv.budget = source_cv.budget or org_cv.budget
                     org_cv.currency = source_cv.currency or org_cv.currency
+                    org_cv.template_governance = gov_camp
                     org_cv.settings = merged_camp_settings
                     org_cv.parameters = merged_camp_settings
                     flag_modified(org_cv, "target_forms")
                     flag_modified(org_cv, "target_projects")
+                    flag_modified(org_cv, "template_governance")
                     flag_modified(org_cv, "settings")
                     flag_modified(org_cv, "parameters")
                     await db.flush()
@@ -2677,19 +2958,42 @@ class PluginService:
             if isinstance(f_val, dict):
                 features_to_sync[f_code] = f_val
 
-        # 2. Depuis les outils de type 'feature' ou globaux
+        # 2. Depuis les outils de type 'feature' ou de configuration globale ('tool_global')
         for tool in raw_tools:
             t_type = tool.get("type") or tool.get("tool_type")
+            t_target = tool.get("config_target")
             t_code = tool.get("code") or tool.get("tool_code")
-            if t_type == "feature" or t_code in ("projects", "resources", "dynamic_resources", "forms", "campaigns"):
-                f_code = t_code or tool.get("feature_code", "feature")
+            # Une fonctionnalité explicite est prioritaire
+            if t_type == "feature" or t_target == "tool_global":
+                f_code = t_code or tool.get("feature_code")
+                if not f_code:
+                    continue
+                t_params = dict(tool.get("parameters") or {})
+                t_perms = dict(tool.get("permissions") or {})
+                if not t_perms and "permissions" in t_params:
+                    t_perms = dict(t_params["permissions"] or {})
+                perms_mode = tool.get("permissions_mode") or t_params.get("permissions_mode")
+                if perms_mode:
+                    t_perms["permissions_mode"] = perms_mode
+                    t_params["permissions_mode"] = perms_mode
                 features_to_sync[f_code] = {
                     "name": tool.get("name") or tool.get("title") or f_code.capitalize(),
                     "description": tool.get("description", ""),
-                    "parameters": tool.get("parameters") or {},
-                    "permissions": tool.get("permissions") or {},
-                    "settings": tool.get("parameters") or {},
+                    "parameters": t_params,
+                    "permissions": t_perms,
+                    "settings": t_params,
                 }
+            elif t_code in ("resources", "dynamic_resources", "forms", "projects", "campaigns"):
+                # Si des modules sont embarqués, s'assurer que la fonctionnalité parente existe
+                f_family = "resources" if t_code in ("resources", "dynamic_resources") else t_code
+                if f_family not in features_to_sync:
+                    features_to_sync[f_family] = {
+                        "name": f"Gestion des {f_family.capitalize()}",
+                        "description": f"Fonctionnalité automatique de gestion pour {f_family}",
+                        "parameters": {},
+                        "permissions": {"permissions_mode": tool.get("permissions_mode") or "restricted"},
+                        "settings": {},
+                    }
 
         # Appliquer les fonctionnalités actives sur la version dans le workspace
         current_active_features = set((org_ver.settings or {}).get("active_features", []))
@@ -2734,12 +3038,35 @@ class PluginService:
                     org_feat.user_ids = curr_feat_users
                     flag_modified(org_feat, "user_ids")
 
-                org_feat.parameters = f_data.get("parameters", org_feat.parameters)
-                org_feat.permissions = f_data.get("permissions", org_feat.permissions)
-                org_feat.settings = f_data.get("settings", org_feat.settings)
-                flag_modified(org_feat, "parameters")
-                flag_modified(org_feat, "permissions")
-                flag_modified(org_feat, "settings")
+                # RÈGLE D'OR : Les fonctionnalités n'ont pas de version propre.
+                # Ce sont les paramètres, configs et permissions de la DERNIÈRE version installée qui s'appliquent.
+                org_feat.organization_plugin_version_id = org_ver.id
+
+                # Synchronisation chirurgicale des modifications sur la fonctionnalité
+                new_name = f_data.get("name")
+                if new_name and new_name != org_feat.name:
+                    org_feat.name = new_name
+
+                new_desc = f_data.get("description")
+                if new_desc is not None and new_desc != org_feat.description:
+                    org_feat.description = new_desc
+
+                new_params = f_data.get("parameters") or {}
+                if new_params != org_feat.parameters:
+                    org_feat.parameters = new_params
+                    flag_modified(org_feat, "parameters")
+
+                new_perms = f_data.get("permissions") or {}
+                if new_perms != org_feat.permissions:
+                    org_feat.permissions = new_perms
+                    flag_modified(org_feat, "permissions")
+
+                new_settings = f_data.get("settings") or {}
+                if new_settings != org_feat.settings:
+                    org_feat.settings = new_settings
+                    flag_modified(org_feat, "settings")
+
+                org_feat.status = "active"
                 await db.flush()
 
         # Synchronisation des active_features sur la version et le plugin de l'organisation

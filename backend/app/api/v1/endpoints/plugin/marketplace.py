@@ -1543,9 +1543,9 @@ async def get_workspace_resource_detail(
 
     res_gov = (target_ver.template_governance if target_ver else {}) or res.parameters.get("template_governance", {})
     if res_gov:
-        for k, v in res_gov.items():
-            if k not in feature_perms:
-                feature_perms[k] = v
+        feature_perms.update(res_gov)
+    if target_ver and target_ver.parameters:
+        feature_params.update(target_ver.parameters)
 
     effective_schema = target_ver.schema_fields if target_ver and target_ver.schema_fields else (res.schema_fields or [])
 
@@ -1672,6 +1672,14 @@ async def clone_workspace_resource_version(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Action non autorisée : Impossible de cloner la version source « v{source_ver.version_number} » car elle est encore en brouillon."
+        )
+
+    # Contrôle de gouvernance
+    gov = (source_ver.template_governance if source_ver else {}) or res.parameters.get("template_governance", {})
+    if gov.get("allow_creation") is False or gov.get("allow_new_versions") is False:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="La création ou le clonage de versions est verrouillé par la gouvernance."
         )
 
     new_ver = OrganizationResourceVersion(
@@ -1840,11 +1848,27 @@ async def update_workspace_resource_version(
             detail=f"Action refusée : La version v{ver.version_number} est scellée ({ver.status}). Son schéma et ses configurations ne peuvent plus être modifiés."
         )
 
+    gov = (ver.template_governance or {}) or (ver.parameters.get("template_governance") if ver.parameters else {})
     if "description" in payload:
         ver.description = payload["description"]
     if "changelog" in payload:
         ver.changelog = payload["changelog"]
     if "schema_fields" in payload:
+        allow_schema = gov.get("allow_schema_modification", gov.get("allow_edit_schema", False))
+        if allow_schema is False:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="La modification de structure (schéma) est verrouillée par la gouvernance."
+            )
+        mandatory_fields = gov.get("mandatory_fields", [])
+        if mandatory_fields:
+            new_field_names = {f.get("name") for f in payload["schema_fields"] if isinstance(f, dict)}
+            missing = [mf for mf in mandatory_fields if mf not in new_field_names]
+            if missing:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Les champs sanctuarisés suivants sont obligatoires dans le schéma : {', '.join(missing)}"
+                )
         ver.schema_fields = payload["schema_fields"]
         flag_modified(ver, "schema_fields")
     if "settings" in payload:
@@ -2092,7 +2116,12 @@ async def create_workspace_resource_item(
 
     # Contrôle de gouvernance
     gov = (target_ver.template_governance if target_ver else {}) or res.parameters.get("template_governance", {})
-    if gov.get("allow_creation") is False or gov.get("allow_data_addition") is False:
+    allow_creation = (
+        gov.get("allow_creation") is not False
+        and gov.get("allow_data_addition") is not False
+        and gov.get("allow_add_records") is not False
+    )
+    if not allow_creation:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="L'ajout d'enregistrements est verrouillé pour cette ressource souveraine."
@@ -2199,10 +2228,27 @@ async def update_workspace_resource_item(
         item_ver = res.versions[0]
 
     gov = (item_ver.template_governance if item_ver else {}) or res.parameters.get("template_governance", {})
-    if gov.get("allow_data_update") is False:
+    allow_update = (
+        gov.get("allow_data_update") is not False
+        and gov.get("allow_edit") is not False
+        and gov.get("allow_edit_records") is not False
+    )
+    if not allow_update:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="La modification d'enregistrements est verrouillée par la gouvernance."
+        )
+
+    is_initial_item = bool(item.source_resource_item_id)
+    if gov.get("locked_rows_mode") == "all_initial" and is_initial_item:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Cet enregistrement initial certifié est verrouillé et ne peut pas être modifié."
+        )
+    if gov.get("editable_rows_mode") == "none":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="La modification d'enregistrements est désactivée par la gouvernance."
         )
 
     excluded_fields = set(gov.get("excluded_record_edit_fields", []))
@@ -2292,10 +2338,31 @@ async def delete_workspace_resource_item(
         item_ver = next((v for v in (res.versions or []) if v.id == item.organization_resource_version_id), None)
 
     gov = (item_ver.template_governance if item_ver else {}) or res.parameters.get("template_governance", {})
-    if gov.get("allow_data_deletion") is False:
+    allow_deletion = (
+        gov.get("allow_data_deletion") is True
+        or gov.get("allow_delete") is True
+        or gov.get("allow_delete_records") is True
+        or gov.get("allow_resource_deletion") is True
+    ) and (
+        gov.get("allow_data_deletion") is not False
+        and gov.get("allow_delete_records") is not False
+    )
+    if not allow_deletion:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="La suppression d'enregistrements est interdite par la gouvernance."
+        )
+
+    is_initial_item = bool(item.source_resource_item_id)
+    if gov.get("locked_rows_mode") == "all_initial" and is_initial_item:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Cet enregistrement initial certifié est verrouillé et ne peut pas être supprimé."
+        )
+    if gov.get("deletable_rows_mode") == "none":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="La suppression d'enregistrements est désactivée par la gouvernance."
         )
 
     if item_ver:
@@ -2515,12 +2582,12 @@ async def get_workspace_form_detail(
     feature_perms = dict((target_feat.permissions if target_feat else {}) or {})
     feature_params = dict((target_feat.parameters if target_feat else {}) or {})
 
-    # Intégrer la gouvernance de la version du formulaire
+    # Intégrer la gouvernance de la version du formulaire (priorité à la gouvernance scellée de la version)
     ver_gov = (target_ver.template_governance if target_ver else {}) or frm.parameters.get("template_governance", {})
     if ver_gov:
-        for k, v in ver_gov.items():
-            if k not in feature_perms:
-                feature_perms[k] = v
+        feature_perms.update(ver_gov)
+    if target_ver and target_ver.parameters:
+        feature_params.update(target_ver.parameters)
 
     # Construire l'arborescence des sections et questions de la version
     all_sections = target_ver.sections if target_ver else []
@@ -2847,6 +2914,10 @@ async def get_workspace_project_detail(
             "allow_attach_form": True,
             "allow_detach_form": True,
         }
+
+    feature_perms.update(ver_gov)
+    if target_ver and target_ver.parameters:
+        feature_params.update(target_ver.parameters)
 
     attached_fvs = (target_ver.settings or {}).get("attached_form_versions", []) if target_ver else []
 
@@ -3606,6 +3677,10 @@ async def get_workspace_campaign_detail(
             "allow_attach_form": True,
             "allow_detach_form": True,
         }
+
+    feature_perms.update(ver_gov)
+    if target_ver and target_ver.parameters:
+        feature_params.update(target_ver.parameters)
 
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc)
