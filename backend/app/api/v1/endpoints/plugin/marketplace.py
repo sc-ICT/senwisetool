@@ -1091,6 +1091,8 @@ async def get_downloaded_versions(
 @router.get("/organization/workspace-summary")
 async def get_workspace_summary(
     org_id: Optional[int] = Query(None, description="ID organisation"),
+    plugin_code: Optional[str] = Query(None, description="Code du plugin actif"),
+    version_id: Optional[int] = Query(None, description="ID de la version active du plugin"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -1123,130 +1125,175 @@ async def get_workspace_summary(
 
     raw_installs = await plugin_service.list_installed_plugins_for_org(db=db, org_id=org.id)
 
+    def _is_pub(v) -> bool:
+        return getattr(v, "status", "") == "published" or getattr(v, "publication_number", None) is not None or "/" in str(getattr(v, "version_number", ""))
+
+    def _serialize_res_version(rv):
+        return {
+            "id": rv.id,
+            "version_number": rv.version_number,
+            "status": rv.status,
+            "description": rv.description,
+            "schema_fields": rv.schema_fields or [],
+            "metrics": rv.metrics or {},
+            "template_governance": rv.template_governance or {},
+            "parameters": rv.parameters or {},
+            "settings": rv.settings or {},
+            "publication_number": rv.publication_number,
+            "origin_version_id": rv.origin_version_id,
+            "organization_plugin_version_id": rv.organization_plugin_version_id,
+            "published_at": rv.published_at.isoformat() if rv.published_at else None,
+        }
+
+    def _serialize_proj_version(pv):
+        return {
+            "id": pv.id,
+            "version_number": pv.version_number,
+            "status": pv.status,
+            "description": pv.description,
+            "template_governance": pv.template_governance or {},
+            "parameters": pv.parameters or {},
+            "settings": pv.settings or {},
+            "publication_number": pv.publication_number,
+            "origin_version_id": pv.origin_version_id,
+            "organization_plugin_version_id": pv.organization_plugin_version_id,
+            "published_at": pv.published_at.isoformat() if pv.published_at else None,
+        }
+
+    def _serialize_form_version(fv):
+        return {
+            "id": fv.id,
+            "version_number": fv.version_number,
+            "status": fv.status,
+            "description": fv.description,
+            "form_type": fv.form_type,
+            "template_governance": fv.template_governance or {},
+            "parameters": fv.parameters or {},
+            "settings": fv.settings or {},
+            "publication_number": fv.publication_number,
+            "origin_version_id": fv.origin_version_id,
+            "organization_plugin_version_id": fv.organization_plugin_version_id,
+            "published_at": fv.published_at.isoformat() if fv.published_at else None,
+        }
+
+    def _serialize_camp_version(cv):
+        return {
+            "id": cv.id,
+            "version_number": cv.version_number,
+            "status": cv.status,
+            "description": cv.description,
+            "start_date": cv.start_date.isoformat() if cv.start_date else None,
+            "end_date": cv.end_date.isoformat() if cv.end_date else None,
+            "budget": cv.budget,
+            "currency": cv.currency,
+            "target_forms": cv.target_forms or [],
+            "target_projects": cv.target_projects or [],
+            "template_governance": cv.template_governance or {},
+            "parameters": cv.parameters or {},
+            "settings": cv.settings or {},
+            "publication_number": cv.publication_number,
+            "origin_version_id": cv.origin_version_id,
+            "organization_plugin_version_id": cv.organization_plugin_version_id,
+            "published_at": cv.published_at.isoformat() if cv.published_at else None,
+        }
+
+    serialized_projects = []
+    for p in projs:
+        all_p_vers = p.versions or []
+        nat_vers = [pv for pv in all_p_vers if not _is_pub(pv)]
+        pub_vers = [pv for pv in all_p_vers if _is_pub(pv)]
+        # Classer natifs en premier par version / id décroissant
+        sorted_vers = sorted(nat_vers, key=lambda x: x.id, reverse=True) + sorted(pub_vers, key=lambda x: (x.publication_number or 0, x.id), reverse=True)
+        serialized_projects.append({
+            "id": p.id,
+            "source_project_id": p.source_project_id,
+            "name": p.name,
+            "code": p.code,
+            "project_type": p.project_type,
+            "category": p.category,
+            "status": p.status,
+            "parameters": p.parameters or {},
+            "settings": p.settings or {},
+            "versions": [_serialize_proj_version(pv) for pv in sorted_vers],
+            "native_versions": [_serialize_proj_version(pv) for pv in sorted(nat_vers, key=lambda x: x.id, reverse=True)],
+            "published_versions": [_serialize_proj_version(pv) for pv in sorted(pub_vers, key=lambda x: (x.publication_number or 0, x.id), reverse=True)],
+        })
+
+    serialized_resources = []
+    for r in ress:
+        all_r_vers = r.versions or []
+        nat_vers = [rv for rv in all_r_vers if not _is_pub(rv)]
+        pub_vers = [rv for rv in all_r_vers if _is_pub(rv)]
+        sorted_vers = sorted(nat_vers, key=lambda x: x.id, reverse=True) + sorted(pub_vers, key=lambda x: (x.publication_number or 0, x.id), reverse=True)
+        serialized_resources.append({
+            "id": r.id,
+            "source_resource_id": r.source_resource_id,
+            "name": r.name,
+            "code": r.code,
+            "category": r.category,
+            "status": r.status,
+            "version": r.version,
+            "icon": r.icon,
+            "cover_image_url": r.cover_image_url,
+            "schema_fields": r.schema_fields or [],
+            "metrics": r.metrics or {},
+            "parameters": r.parameters or {},
+            "settings": r.settings or {},
+            "versions": [_serialize_res_version(rv) for rv in sorted_vers],
+            "native_versions": [_serialize_res_version(rv) for rv in sorted(nat_vers, key=lambda x: x.id, reverse=True)],
+            "published_versions": [_serialize_res_version(rv) for rv in sorted(pub_vers, key=lambda x: (x.publication_number or 0, x.id), reverse=True)],
+        })
+
+    serialized_forms = []
+    for f in forms:
+        all_f_vers = f.versions or []
+        nat_vers = [fv for fv in all_f_vers if not _is_pub(fv)]
+        pub_vers = [fv for fv in all_f_vers if _is_pub(fv)]
+        sorted_vers = sorted(nat_vers, key=lambda x: x.id, reverse=True) + sorted(pub_vers, key=lambda x: (x.publication_number or 0, x.id), reverse=True)
+        serialized_forms.append({
+            "id": f.id,
+            "source_form_id": f.source_form_id,
+            "name": f.name,
+            "code": f.code,
+            "description": f.description,
+            "status": f.status,
+            "version": f.version,
+            "parameters": f.parameters or {},
+            "settings": f.settings or {},
+            "versions": [_serialize_form_version(fv) for fv in sorted_vers],
+            "native_versions": [_serialize_form_version(fv) for fv in sorted(nat_vers, key=lambda x: x.id, reverse=True)],
+            "published_versions": [_serialize_form_version(fv) for fv in sorted(pub_vers, key=lambda x: (x.publication_number or 0, x.id), reverse=True)],
+        })
+
+    serialized_campaigns = []
+    for c in camps:
+        all_c_vers = c.versions or []
+        nat_vers = [cv for cv in all_c_vers if not _is_pub(cv)]
+        pub_vers = [cv for cv in all_c_vers if _is_pub(cv)]
+        sorted_vers = sorted(nat_vers, key=lambda x: x.id, reverse=True) + sorted(pub_vers, key=lambda x: (x.publication_number or 0, x.id), reverse=True)
+        serialized_campaigns.append({
+            "id": c.id,
+            "source_campaign_id": c.source_campaign_id,
+            "name": c.name,
+            "code": c.code,
+            "description": c.description,
+            "status": c.status,
+            "version": c.version,
+            "parameters": c.parameters or {},
+            "settings": c.settings or {},
+            "target_forms": (c.versions[0].target_forms if c.versions else []) or [],
+            "target_projects": (c.versions[0].target_projects if c.versions else []) or [],
+            "versions": [_serialize_camp_version(cv) for cv in sorted_vers],
+            "native_versions": [_serialize_camp_version(cv) for cv in sorted(nat_vers, key=lambda x: x.id, reverse=True)],
+            "published_versions": [_serialize_camp_version(cv) for cv in sorted(pub_vers, key=lambda x: (x.publication_number or 0, x.id), reverse=True)],
+        })
+
     return {
         "plugins": [it["installation"] for it in raw_installs],
-        "projects": [
-            {
-                "id": p.id,
-                "source_project_id": p.source_project_id,
-                "name": p.name,
-                "code": p.code,
-                "project_type": p.project_type,
-                "category": p.category,
-                "status": p.status,
-                "parameters": p.parameters or {},
-                "settings": p.settings or {},
-                "versions": [
-                    {
-                        "id": pv.id,
-                        "version_number": pv.version_number,
-                        "status": pv.status,
-                        "description": pv.description,
-                        "template_governance": pv.template_governance or {},
-                        "parameters": pv.parameters or {},
-                        "settings": pv.settings or {},
-                    }
-                    for pv in (p.versions or [])
-                ],
-            }
-            for p in projs
-        ],
-        "resources": [
-            {
-                "id": r.id,
-                "source_resource_id": r.source_resource_id,
-                "name": r.name,
-                "code": r.code,
-                "category": r.category,
-                "status": r.status,
-                "version": r.version,
-                "icon": r.icon,
-                "cover_image_url": r.cover_image_url,
-                "schema_fields": r.schema_fields or [],
-                "metrics": r.metrics or {},
-                "parameters": r.parameters or {},
-                "settings": r.settings or {},
-                "versions": [
-                    {
-                        "id": rv.id,
-                        "version_number": rv.version_number,
-                        "status": rv.status,
-                        "description": rv.description,
-                        "schema_fields": rv.schema_fields or [],
-                        "metrics": rv.metrics or {},
-                        "template_governance": rv.template_governance or {},
-                        "parameters": rv.parameters or {},
-                        "settings": rv.settings or {},
-                        "publication_number": rv.publication_number,
-                        "origin_version_id": rv.origin_version_id,
-                        "published_at": rv.published_at.isoformat() if rv.published_at else None,
-                    }
-                    for rv in (r.versions or [])
-                ],
-            }
-            for r in ress
-        ],
-        "forms": [
-            {
-                "id": f.id,
-                "source_form_id": f.source_form_id,
-                "name": f.name,
-                "code": f.code,
-                "description": f.description,
-                "status": f.status,
-                "version": f.version,
-                "parameters": f.parameters or {},
-                "settings": f.settings or {},
-                "versions": [
-                    {
-                        "id": fv.id,
-                        "version_number": fv.version_number,
-                        "status": fv.status,
-                        "description": fv.description,
-                        "form_type": fv.form_type,
-                        "template_governance": fv.template_governance or {},
-                        "parameters": fv.parameters or {},
-                        "settings": fv.settings or {},
-                    }
-                    for fv in (f.versions or [])
-                ],
-            }
-            for f in forms
-        ],
-        "campaigns": [
-            {
-                "id": c.id,
-                "source_campaign_id": c.source_campaign_id,
-                "name": c.name,
-                "code": c.code,
-                "description": c.description,
-                "status": c.status,
-                "version": c.version,
-                "parameters": c.parameters or {},
-                "settings": c.settings or {},
-                "target_forms": (c.versions[0].target_forms if c.versions else []) or [],
-                "target_projects": (c.versions[0].target_projects if c.versions else []) or [],
-                "versions": [
-                    {
-                        "id": cv.id,
-                        "version_number": cv.version_number,
-                        "status": cv.status,
-                        "description": cv.description,
-                        "start_date": cv.start_date.isoformat() if cv.start_date else None,
-                        "end_date": cv.end_date.isoformat() if cv.end_date else None,
-                        "budget": cv.budget,
-                        "currency": cv.currency,
-                        "target_forms": cv.target_forms or [],
-                        "target_projects": cv.target_projects or [],
-                        "template_governance": cv.template_governance or {},
-                        "parameters": cv.parameters or {},
-                        "settings": cv.settings or {},
-                    }
-                    for cv in (c.versions or [])
-                ],
-            }
-            for c in camps
-        ],
+        "projects": serialized_projects,
+        "resources": serialized_resources,
+        "forms": serialized_forms,
+        "campaigns": serialized_campaigns,
         "features": [
             {
                 "id": feat.id,
@@ -1259,6 +1306,250 @@ async def get_workspace_summary(
             }
             for feat in org_feats
         ]
+    }
+
+
+@router.get("/organization/published-modules-summary")
+async def get_published_modules_summary(
+    org_id: Optional[int] = Query(None, description="ID organisation"),
+    plugin_code: Optional[str] = Query(None, description="Code du plugin actif"),
+    version_id: Optional[int] = Query(None, description="ID de la version du plugin active"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    [Espace Organisation] Retourne l'ensemble des modules publiés et scellés
+    (ressources, formulaires, projets, campagnes) pour le plugin et la version sélectionnés.
+    Permet de basculer entre les différentes versions d'un plugin pour explorer leurs publications scellées.
+    """
+    org = await _resolve_user_organization(db, current_user, org_id)
+    if not org:
+        return {
+            "plugins": [],
+            "selected_plugin": None,
+            "selected_version": None,
+            "published_resources": [],
+            "published_forms": [],
+            "published_projects": [],
+            "published_campaigns": [],
+            "total_count": 0,
+        }
+
+    raw_installs = await plugin_service.list_installed_plugins_for_org(db=db, org_id=org.id)
+    plugins_data = [it["installation"] for it in raw_installs]
+
+    selected_plugin = None
+    if plugin_code:
+        for p in plugins_data:
+            if p.get("code") == plugin_code:
+                selected_plugin = p
+                break
+    if not selected_plugin and plugins_data:
+        selected_plugin = plugins_data[0]
+
+    selected_version = None
+    target_org_plugin_version_id = None
+    if selected_plugin:
+        downloaded = selected_plugin.get("downloaded_versions") or []
+        if version_id:
+            for dv in downloaded:
+                if dv.get("id") == version_id or dv.get("plugin_version_id") == version_id:
+                    selected_version = dv
+                    target_org_plugin_version_id = dv.get("id")
+                    break
+        if not selected_version and downloaded:
+            selected_version = downloaded[0]
+            target_org_plugin_version_id = selected_version.get("id")
+
+    # Requêtes pour les modules publiés
+    # 1. Ressources
+    r_stmt = select(OrganizationResource).options(selectinload(OrganizationResource.versions)).where(
+        OrganizationResource.organization_id == org.id
+    ).order_by(OrganizationResource.id.asc())
+    all_ress = (await db.execute(r_stmt)).scalars().all()
+
+    published_resources = []
+    for r in all_ress:
+        pub_vers = [
+            v for v in (r.versions or [])
+            if v.status == "published" or v.publication_number is not None or "/" in str(v.version_number)
+        ]
+        if target_org_plugin_version_id:
+            pub_vers = [
+                v for v in pub_vers
+                if v.organization_plugin_version_id == target_org_plugin_version_id
+            ]
+
+        if pub_vers:
+            published_resources.append({
+                "id": r.id,
+                "name": r.name,
+                "code": r.code,
+                "category": r.category,
+                "icon": r.icon,
+                "cover_image_url": r.cover_image_url,
+                "published_versions": [
+                    {
+                        "id": pv.id,
+                        "version_number": pv.version_number,
+                        "status": pv.status,
+                        "publication_number": pv.publication_number,
+                        "origin_version_id": pv.origin_version_id,
+                        "published_at": pv.published_at.isoformat() if pv.published_at else None,
+                        "description": pv.description,
+                        "changelog": pv.changelog,
+                        "schema_fields": pv.schema_fields or [],
+                        "fields_count": len(pv.schema_fields or []),
+                        "metrics": pv.metrics or {},
+                        "item_count": (pv.metrics or {}).get("item_count", 0),
+                        "template_governance": pv.template_governance or {},
+                        "organization_plugin_version_id": pv.organization_plugin_version_id,
+                    }
+                    for pv in sorted(pub_vers, key=lambda x: (x.publication_number or 0, x.id), reverse=True)
+                ]
+            })
+
+    # 2. Formulaires
+    f_stmt = select(OrganizationForm).options(selectinload(OrganizationForm.versions)).where(
+        OrganizationForm.organization_id == org.id
+    ).order_by(OrganizationForm.id.asc())
+    all_forms = (await db.execute(f_stmt)).scalars().all()
+
+    published_forms = []
+    for f in all_forms:
+        pub_vers = [
+            v for v in (f.versions or [])
+            if v.status == "published" or v.publication_number is not None or "/" in str(v.version_number)
+        ]
+        if target_org_plugin_version_id:
+            pub_vers = [
+                v for v in pub_vers
+                if v.organization_plugin_version_id == target_org_plugin_version_id
+            ]
+
+        if pub_vers:
+            published_forms.append({
+                "id": f.id,
+                "name": f.name,
+                "code": f.code,
+                "published_versions": [
+                    {
+                        "id": pv.id,
+                        "version_number": pv.version_number,
+                        "status": pv.status,
+                        "publication_number": pv.publication_number,
+                        "origin_version_id": pv.origin_version_id,
+                        "published_at": pv.published_at.isoformat() if pv.published_at else None,
+                        "description": pv.description,
+                        "form_type": pv.form_type,
+                        "template_governance": pv.template_governance or {},
+                        "organization_plugin_version_id": pv.organization_plugin_version_id,
+                    }
+                    for pv in sorted(pub_vers, key=lambda x: (x.publication_number or 0, x.id), reverse=True)
+                ]
+            })
+
+    # 3. Projets
+    p_stmt = select(OrganizationProject).options(selectinload(OrganizationProject.versions)).where(
+        OrganizationProject.organization_id == org.id
+    ).order_by(OrganizationProject.id.asc())
+    all_projs = (await db.execute(p_stmt)).scalars().all()
+
+    published_projects = []
+    for p in all_projs:
+        pub_vers = [
+            v for v in (p.versions or [])
+            if v.status == "published" or v.publication_number is not None or "/" in str(v.version_number)
+        ]
+        if target_org_plugin_version_id:
+            pub_vers = [
+                v for v in pub_vers
+                if v.organization_plugin_version_id == target_org_plugin_version_id
+            ]
+
+        if pub_vers:
+            published_projects.append({
+                "id": p.id,
+                "name": p.name,
+                "code": p.code,
+                "project_type": p.project_type,
+                "category": p.category,
+                "published_versions": [
+                    {
+                        "id": pv.id,
+                        "version_number": pv.version_number,
+                        "status": pv.status,
+                        "publication_number": pv.publication_number,
+                        "origin_version_id": pv.origin_version_id,
+                        "published_at": pv.published_at.isoformat() if pv.published_at else None,
+                        "description": pv.description,
+                        "template_governance": pv.template_governance or {},
+                        "organization_plugin_version_id": pv.organization_plugin_version_id,
+                    }
+                    for pv in sorted(pub_vers, key=lambda x: (x.publication_number or 0, x.id), reverse=True)
+                ]
+            })
+
+    # 4. Campagnes
+    c_stmt = select(OrganizationCampaign).options(selectinload(OrganizationCampaign.versions)).where(
+        OrganizationCampaign.organization_id == org.id
+    ).order_by(OrganizationCampaign.id.asc())
+    all_camps = (await db.execute(c_stmt)).scalars().all()
+
+    published_campaigns = []
+    for c in all_camps:
+        pub_vers = [
+            v for v in (c.versions or [])
+            if v.status == "published" or v.publication_number is not None or "/" in str(v.version_number)
+        ]
+        if target_org_plugin_version_id:
+            pub_vers = [
+                v for v in pub_vers
+                if v.organization_plugin_version_id == target_org_plugin_version_id
+            ]
+
+        if pub_vers:
+            published_campaigns.append({
+                "id": c.id,
+                "name": c.name,
+                "code": c.code,
+                "published_versions": [
+                    {
+                        "id": pv.id,
+                        "version_number": pv.version_number,
+                        "status": pv.status,
+                        "publication_number": pv.publication_number,
+                        "origin_version_id": pv.origin_version_id,
+                        "published_at": pv.published_at.isoformat() if pv.published_at else None,
+                        "description": pv.description,
+                        "start_date": pv.start_date.isoformat() if pv.start_date else None,
+                        "end_date": pv.end_date.isoformat() if pv.end_date else None,
+                        "budget": pv.budget,
+                        "currency": pv.currency,
+                        "template_governance": pv.template_governance or {},
+                        "organization_plugin_version_id": pv.organization_plugin_version_id,
+                    }
+                    for pv in sorted(pub_vers, key=lambda x: (x.publication_number or 0, x.id), reverse=True)
+                ]
+            })
+
+    total_count = (
+        sum(len(r["published_versions"]) for r in published_resources)
+        + sum(len(f["published_versions"]) for f in published_forms)
+        + sum(len(p["published_versions"]) for p in published_projects)
+        + sum(len(c["published_versions"]) for c in published_campaigns)
+    )
+
+    return {
+        "organization": {"id": org.id, "name": org.name},
+        "plugins": plugins_data,
+        "selected_plugin": selected_plugin,
+        "selected_version": selected_version,
+        "published_resources": published_resources,
+        "published_forms": published_forms,
+        "published_projects": published_projects,
+        "published_campaigns": published_campaigns,
+        "total_count": total_count,
     }
 
 
