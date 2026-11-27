@@ -1309,6 +1309,92 @@ async def get_workspace_summary(
     }
 
 
+@router.get("/organization/published-plugins")
+async def get_published_plugins(
+    org_id: Optional[int] = Query(None, description="ID organisation"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    [Espace Organisation] Retourne la liste des plugins ayant au moins une version
+    avec des modules publiés (pour alimenter la sidebar de l'organisation).
+    """
+    org = await _resolve_user_organization(db, current_user, org_id)
+    if not org:
+        return {"plugins_with_publications": []}
+
+    raw_installs = await plugin_service.list_installed_plugins_for_org(db=db, org_id=org.id)
+    plugins_data = [it["installation"] for it in raw_installs]
+
+    r_stmt = select(OrganizationResource).options(selectinload(OrganizationResource.versions)).where(
+        OrganizationResource.organization_id == org.id
+    )
+    all_ress = (await db.execute(r_stmt)).scalars().all()
+
+    f_stmt = select(OrganizationForm).options(selectinload(OrganizationForm.versions)).where(
+        OrganizationForm.organization_id == org.id
+    )
+    all_forms = (await db.execute(f_stmt)).scalars().all()
+
+    p_stmt = select(OrganizationProject).options(selectinload(OrganizationProject.versions)).where(
+        OrganizationProject.organization_id == org.id
+    )
+    all_projs = (await db.execute(p_stmt)).scalars().all()
+
+    c_stmt = select(OrganizationCampaign).options(selectinload(OrganizationCampaign.versions)).where(
+        OrganizationCampaign.organization_id == org.id
+    )
+    all_camps = (await db.execute(c_stmt)).scalars().all()
+
+    def _is_pub(v) -> bool:
+        return getattr(v, "status", "") == "published" or getattr(v, "publication_number", None) is not None or "/" in str(getattr(v, "version_number", ""))
+
+    pub_counts_by_opv_id: Dict[int, int] = {}
+    for r in all_ress:
+        for v in (r.versions or []):
+            if _is_pub(v) and v.organization_plugin_version_id:
+                pub_counts_by_opv_id[v.organization_plugin_version_id] = pub_counts_by_opv_id.get(v.organization_plugin_version_id, 0) + 1
+    for f in all_forms:
+        for v in (f.versions or []):
+            if _is_pub(v) and v.organization_plugin_version_id:
+                pub_counts_by_opv_id[v.organization_plugin_version_id] = pub_counts_by_opv_id.get(v.organization_plugin_version_id, 0) + 1
+    for p in all_projs:
+        for v in (p.versions or []):
+            if _is_pub(v) and v.organization_plugin_version_id:
+                pub_counts_by_opv_id[v.organization_plugin_version_id] = pub_counts_by_opv_id.get(v.organization_plugin_version_id, 0) + 1
+    for c in all_camps:
+        for v in (c.versions or []):
+            if _is_pub(v) and v.organization_plugin_version_id:
+                pub_counts_by_opv_id[v.organization_plugin_version_id] = pub_counts_by_opv_id.get(v.organization_plugin_version_id, 0) + 1
+
+    plugins_with_publications = []
+    for plug in plugins_data:
+        downloaded = plug.get("downloaded_versions") or []
+        vers_with_pubs = [
+            {
+                "id": dv.get("id"),
+                "version_number": dv.get("version_number"),
+                "published_count": pub_counts_by_opv_id.get(dv.get("id"), 0),
+            }
+            for dv in downloaded
+            if pub_counts_by_opv_id.get(dv.get("id"), 0) > 0
+        ]
+        total_pub = sum(v["published_count"] for v in vers_with_pubs)
+        if total_pub > 0:
+            plugins_with_publications.append({
+                "id": plug.get("id"),
+                "code": plug.get("code"),
+                "name": plug.get("name"),
+                "icon_url": plug.get("icon_url"),
+                "banner_url": plug.get("banner_url"),
+                "category": plug.get("category"),
+                "total_published_count": total_pub,
+                "versions_with_publications": vers_with_pubs,
+            })
+
+    return {"plugins_with_publications": plugins_with_publications}
+
+
 @router.get("/organization/published-modules-summary")
 async def get_published_modules_summary(
     org_id: Optional[int] = Query(None, description="ID organisation"),
@@ -1326,8 +1412,10 @@ async def get_published_modules_summary(
     if not org:
         return {
             "plugins": [],
+            "plugins_with_publications": [],
             "selected_plugin": None,
             "selected_version": None,
+            "available_versions": [],
             "published_resources": [],
             "published_forms": [],
             "published_projects": [],
@@ -1338,15 +1426,101 @@ async def get_published_modules_summary(
     raw_installs = await plugin_service.list_installed_plugins_for_org(db=db, org_id=org.id)
     plugins_data = [it["installation"] for it in raw_installs]
 
+    # Requêtes pour tous les modules
+    r_stmt = select(OrganizationResource).options(selectinload(OrganizationResource.versions)).where(
+        OrganizationResource.organization_id == org.id
+    ).order_by(OrganizationResource.id.asc())
+    all_ress = (await db.execute(r_stmt)).scalars().all()
+
+    f_stmt = select(OrganizationForm).options(selectinload(OrganizationForm.versions)).where(
+        OrganizationForm.organization_id == org.id
+    ).order_by(OrganizationForm.id.asc())
+    all_forms = (await db.execute(f_stmt)).scalars().all()
+
+    p_stmt = select(OrganizationProject).options(selectinload(OrganizationProject.versions)).where(
+        OrganizationProject.organization_id == org.id
+    ).order_by(OrganizationProject.id.asc())
+    all_projs = (await db.execute(p_stmt)).scalars().all()
+
+    c_stmt = select(OrganizationCampaign).options(selectinload(OrganizationCampaign.versions)).where(
+        OrganizationCampaign.organization_id == org.id
+    ).order_by(OrganizationCampaign.id.asc())
+    all_camps = (await db.execute(c_stmt)).scalars().all()
+
+    def _is_pub(v) -> bool:
+        return getattr(v, "status", "") == "published" or getattr(v, "publication_number", None) is not None or "/" in str(getattr(v, "version_number", ""))
+
+    # Calcul des publications par organization_plugin_version_id
+    pub_counts_by_opv_id: Dict[int, int] = {}
+    for r in all_ress:
+        for v in (r.versions or []):
+            if _is_pub(v) and v.organization_plugin_version_id:
+                pub_counts_by_opv_id[v.organization_plugin_version_id] = pub_counts_by_opv_id.get(v.organization_plugin_version_id, 0) + 1
+    for f in all_forms:
+        for v in (f.versions or []):
+            if _is_pub(v) and v.organization_plugin_version_id:
+                pub_counts_by_opv_id[v.organization_plugin_version_id] = pub_counts_by_opv_id.get(v.organization_plugin_version_id, 0) + 1
+    for p in all_projs:
+        for v in (p.versions or []):
+            if _is_pub(v) and v.organization_plugin_version_id:
+                pub_counts_by_opv_id[v.organization_plugin_version_id] = pub_counts_by_opv_id.get(v.organization_plugin_version_id, 0) + 1
+    for c in all_camps:
+        for v in (c.versions or []):
+            if _is_pub(v) and v.organization_plugin_version_id:
+                pub_counts_by_opv_id[v.organization_plugin_version_id] = pub_counts_by_opv_id.get(v.organization_plugin_version_id, 0) + 1
+
+    plugins_with_publications = []
+    for plug in plugins_data:
+        downloaded = plug.get("downloaded_versions") or []
+        vers_with_pubs = [
+            {
+                "id": dv.get("id"),
+                "version_number": dv.get("version_number"),
+                "published_count": pub_counts_by_opv_id.get(dv.get("id"), 0),
+            }
+            for dv in downloaded
+            if pub_counts_by_opv_id.get(dv.get("id"), 0) > 0
+        ]
+        total_pub = sum(v["published_count"] for v in vers_with_pubs)
+        if total_pub > 0:
+            plugins_with_publications.append({
+                "id": plug.get("id"),
+                "code": plug.get("code"),
+                "name": plug.get("name"),
+                "icon_url": plug.get("icon_url"),
+                "banner_url": plug.get("banner_url"),
+                "category": plug.get("category"),
+                "total_published_count": total_pub,
+                "versions_with_publications": vers_with_pubs,
+            })
+
+    # Résoudre le plugin sélectionné
     selected_plugin = None
     if plugin_code:
         for p in plugins_data:
             if p.get("code") == plugin_code:
                 selected_plugin = p
                 break
+    # Si pas de plugin_code spécifique, privilégier le premier plugin ayant des publications
+    if not selected_plugin and plugins_with_publications:
+        target_code = plugins_with_publications[0]["code"]
+        for p in plugins_data:
+            if p.get("code") == target_code:
+                selected_plugin = p
+                break
     if not selected_plugin and plugins_data:
         selected_plugin = plugins_data[0]
 
+    # Versions ayant au moins 1 publication pour ce plugin sélectionné
+    available_versions = []
+    if selected_plugin:
+        downloaded = selected_plugin.get("downloaded_versions") or []
+        available_versions = [
+            dv for dv in downloaded
+            if pub_counts_by_opv_id.get(dv.get("id"), 0) > 0
+        ]
+
+    # Résoudre la version sélectionnée : privilégier une version qui a des publications !
     selected_version = None
     target_org_plugin_version_id = None
     if selected_plugin:
@@ -1357,28 +1531,21 @@ async def get_published_modules_summary(
                     selected_version = dv
                     target_org_plugin_version_id = dv.get("id")
                     break
-        if not selected_version and downloaded:
-            selected_version = downloaded[0]
-            target_org_plugin_version_id = selected_version.get("id")
 
-    # Requêtes pour les modules publiés
-    # 1. Ressources
-    r_stmt = select(OrganizationResource).options(selectinload(OrganizationResource.versions)).where(
-        OrganizationResource.organization_id == org.id
-    ).order_by(OrganizationResource.id.asc())
-    all_ress = (await db.execute(r_stmt)).scalars().all()
+        if not selected_version:
+            # Privilégier la première version ayant des publications
+            if available_versions:
+                selected_version = available_versions[0]
+                target_org_plugin_version_id = selected_version.get("id")
+            elif downloaded:
+                selected_version = downloaded[0]
+                target_org_plugin_version_id = selected_version.get("id")
 
     published_resources = []
     for r in all_ress:
-        pub_vers = [
-            v for v in (r.versions or [])
-            if v.status == "published" or v.publication_number is not None or "/" in str(v.version_number)
-        ]
+        pub_vers = [v for v in (r.versions or []) if _is_pub(v)]
         if target_org_plugin_version_id:
-            pub_vers = [
-                v for v in pub_vers
-                if v.organization_plugin_version_id == target_org_plugin_version_id
-            ]
+            pub_vers = [v for v in pub_vers if v.organization_plugin_version_id == target_org_plugin_version_id]
 
         if pub_vers:
             published_resources.append({
@@ -1409,23 +1576,11 @@ async def get_published_modules_summary(
                 ]
             })
 
-    # 2. Formulaires
-    f_stmt = select(OrganizationForm).options(selectinload(OrganizationForm.versions)).where(
-        OrganizationForm.organization_id == org.id
-    ).order_by(OrganizationForm.id.asc())
-    all_forms = (await db.execute(f_stmt)).scalars().all()
-
     published_forms = []
     for f in all_forms:
-        pub_vers = [
-            v for v in (f.versions or [])
-            if v.status == "published" or v.publication_number is not None or "/" in str(v.version_number)
-        ]
+        pub_vers = [v for v in (f.versions or []) if _is_pub(v)]
         if target_org_plugin_version_id:
-            pub_vers = [
-                v for v in pub_vers
-                if v.organization_plugin_version_id == target_org_plugin_version_id
-            ]
+            pub_vers = [v for v in pub_vers if v.organization_plugin_version_id == target_org_plugin_version_id]
 
         if pub_vers:
             published_forms.append({
@@ -1449,23 +1604,11 @@ async def get_published_modules_summary(
                 ]
             })
 
-    # 3. Projets
-    p_stmt = select(OrganizationProject).options(selectinload(OrganizationProject.versions)).where(
-        OrganizationProject.organization_id == org.id
-    ).order_by(OrganizationProject.id.asc())
-    all_projs = (await db.execute(p_stmt)).scalars().all()
-
     published_projects = []
     for p in all_projs:
-        pub_vers = [
-            v for v in (p.versions or [])
-            if v.status == "published" or v.publication_number is not None or "/" in str(v.version_number)
-        ]
+        pub_vers = [v for v in (p.versions or []) if _is_pub(v)]
         if target_org_plugin_version_id:
-            pub_vers = [
-                v for v in pub_vers
-                if v.organization_plugin_version_id == target_org_plugin_version_id
-            ]
+            pub_vers = [v for v in pub_vers if v.organization_plugin_version_id == target_org_plugin_version_id]
 
         if pub_vers:
             published_projects.append({
@@ -1490,23 +1633,11 @@ async def get_published_modules_summary(
                 ]
             })
 
-    # 4. Campagnes
-    c_stmt = select(OrganizationCampaign).options(selectinload(OrganizationCampaign.versions)).where(
-        OrganizationCampaign.organization_id == org.id
-    ).order_by(OrganizationCampaign.id.asc())
-    all_camps = (await db.execute(c_stmt)).scalars().all()
-
     published_campaigns = []
     for c in all_camps:
-        pub_vers = [
-            v for v in (c.versions or [])
-            if v.status == "published" or v.publication_number is not None or "/" in str(v.version_number)
-        ]
+        pub_vers = [v for v in (c.versions or []) if _is_pub(v)]
         if target_org_plugin_version_id:
-            pub_vers = [
-                v for v in pub_vers
-                if v.organization_plugin_version_id == target_org_plugin_version_id
-            ]
+            pub_vers = [v for v in pub_vers if v.organization_plugin_version_id == target_org_plugin_version_id]
 
         if pub_vers:
             published_campaigns.append({
@@ -1543,8 +1674,10 @@ async def get_published_modules_summary(
     return {
         "organization": {"id": org.id, "name": org.name},
         "plugins": plugins_data,
+        "plugins_with_publications": plugins_with_publications,
         "selected_plugin": selected_plugin,
         "selected_version": selected_version,
+        "available_versions": available_versions,
         "published_resources": published_resources,
         "published_forms": published_forms,
         "published_projects": published_projects,
