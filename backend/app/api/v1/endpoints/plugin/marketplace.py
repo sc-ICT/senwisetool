@@ -1319,9 +1319,28 @@ async def get_published_plugins(
     [Espace Organisation] Retourne la liste des plugins ayant au moins une version
     avec des modules publiés (pour alimenter la sidebar de l'organisation).
     """
+    # Si Super Admin sans organisation spécifique demandée, ne pas charger d'organisation arbitraire
+    is_super = bool(
+        current_user.role == UserRole.SUPER_ADMIN or
+        getattr(current_user, "is_superuser", False) or
+        str(getattr(current_user, "role", "")).upper() == "SUPER_ADMIN"
+    )
+    if is_super and not org_id:
+        return {
+            "organization": None,
+            "plugins": [],
+            "plugins_with_publications": [],
+            "total_published_modules": 0,
+        }
+
     org = await _resolve_user_organization(db, current_user, org_id)
     if not org:
-        return {"plugins_with_publications": []}
+        return {
+            "organization": None,
+            "plugins": [],
+            "plugins_with_publications": [],
+            "total_published_modules": 0,
+        }
 
     raw_installs = await plugin_service.list_installed_plugins_for_org(db=db, org_id=org.id)
     plugins_data = [it["installation"] for it in raw_installs]
@@ -1389,10 +1408,18 @@ async def get_published_plugins(
                 "banner_url": plug.get("banner_url"),
                 "category": plug.get("category"),
                 "total_published_count": total_pub,
+                "total_published_modules": total_pub,
                 "versions_with_publications": vers_with_pubs,
             })
 
-    return {"plugins_with_publications": plugins_with_publications}
+    total_published_modules = sum(p["total_published_count"] for p in plugins_with_publications)
+
+    return {
+        "organization": {"id": org.id, "name": org.name},
+        "plugins": plugins_with_publications,
+        "plugins_with_publications": plugins_with_publications,
+        "total_published_modules": total_published_modules,
+    }
 
 
 @router.get("/organization/published-modules-summary")
