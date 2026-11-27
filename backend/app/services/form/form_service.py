@@ -807,6 +807,15 @@ class FormService:
                 detail=f"Sécurité de versionnage : Impossible de supprimer la version « v{ver.version_number} » car elle est publiée. Une version publiée est scellée et immuable. Seules les versions en brouillon peuvent être supprimées."
             )
 
+        # Contrôle strict d'intégrité : vérifier qu'aucune autre version de formulaire n'utilise cette version
+        from app.services.plugin.module_integrity_service import ModuleIntegrityService
+        await ModuleIntegrityService.validate_form_version_can_be_deleted(
+            db=db,
+            form_id=form_id,
+            version_id=version_id,
+            organization_id=organization_id,
+        )
+
         # 2. Vérifier qu'il reste au moins une autre version
         remaining_vers = [v for v in form.versions if v.id != ver.id]
         if not remaining_vers:
@@ -1139,11 +1148,29 @@ class FormService:
         stmt = select(FormQuestion).where(FormQuestion.id == question_id)
         q = (await db.execute(stmt)).scalars().first()
         if not q:
+            from app.models.organization.organization_form import OrganizationFormQuestion
+            org_stmt = select(OrganizationFormQuestion).where(OrganizationFormQuestion.id == question_id)
+            q = (await db.execute(org_stmt)).scalars().first()
+
+        if not q:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Question introuvable.")
 
-        if q.form_version_id:
-            ver_chk = (await db.execute(select(FormVersion).where(FormVersion.id == q.form_version_id))).scalars().first()
-            if ver_chk and ver_chk.status != FormVersionStatus.DRAFT.value:
+        # Contrôle strict d'intégrité : vérifier qu'aucune autre version de formulaire n'utilise cette question
+        from app.services.plugin.module_integrity_service import ModuleIntegrityService
+        await ModuleIntegrityService.validate_form_question_can_be_modified_or_deleted(
+            db=db,
+            question_id=question_id,
+            organization_id=getattr(q, "organization_id", None),
+            is_delete=False,
+        )
+
+        effective_form_version_id = getattr(q, "form_version_id", None) or getattr(q, "organization_form_version_id", None)
+        if effective_form_version_id:
+            ver_chk = (await db.execute(select(FormVersion).where(FormVersion.id == effective_form_version_id))).scalars().first()
+            if not ver_chk:
+                from app.models.organization.organization_form import OrganizationFormVersion
+                ver_chk = (await db.execute(select(OrganizationFormVersion).where(OrganizationFormVersion.id == effective_form_version_id))).scalars().first()
+            if ver_chk and ver_chk.status != FormVersionStatus.DRAFT.value and str(ver_chk.status).lower() not in ("draft", "brouillon"):
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=f"La version « v{ver_chk.version_number} » est scellée ({ver_chk.status}) et ne peut pas être modifiée."
@@ -1194,11 +1221,29 @@ class FormService:
         stmt = select(FormQuestion).where(FormQuestion.id == question_id)
         q = (await db.execute(stmt)).scalars().first()
         if not q:
+            from app.models.organization.organization_form import OrganizationFormQuestion
+            org_stmt = select(OrganizationFormQuestion).where(OrganizationFormQuestion.id == question_id)
+            q = (await db.execute(org_stmt)).scalars().first()
+
+        if not q:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Question introuvable.")
 
-        if q.form_version_id:
-            ver_chk = (await db.execute(select(FormVersion).where(FormVersion.id == q.form_version_id))).scalars().first()
-            if ver_chk and ver_chk.status != FormVersionStatus.DRAFT.value:
+        # Contrôle strict d'intégrité : vérifier qu'aucune autre version de formulaire n'utilise cette question
+        from app.services.plugin.module_integrity_service import ModuleIntegrityService
+        await ModuleIntegrityService.validate_form_question_can_be_modified_or_deleted(
+            db=db,
+            question_id=question_id,
+            organization_id=getattr(q, "organization_id", None),
+            is_delete=True,
+        )
+
+        effective_form_version_id = getattr(q, "form_version_id", None) or getattr(q, "organization_form_version_id", None)
+        if effective_form_version_id:
+            ver_chk = (await db.execute(select(FormVersion).where(FormVersion.id == effective_form_version_id))).scalars().first()
+            if not ver_chk:
+                from app.models.organization.organization_form import OrganizationFormVersion
+                ver_chk = (await db.execute(select(OrganizationFormVersion).where(OrganizationFormVersion.id == effective_form_version_id))).scalars().first()
+            if ver_chk and ver_chk.status != FormVersionStatus.DRAFT.value and str(ver_chk.status).lower() not in ("draft", "brouillon"):
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=f"La version « v{ver_chk.version_number} » est scellée ({ver_chk.status}) et ne peut pas être modifiée."

@@ -1869,6 +1869,18 @@ async def update_workspace_resource_version(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=f"Les champs sanctuarisés suivants sont obligatoires dans le schéma : {', '.join(missing)}"
                 )
+
+        # Contrôle strict d'intégrité référentielle : aucun champ utilisé par une autre ressource ou formulaire ne peut être modifié/supprimé
+        from app.services.plugin.module_integrity_service import ModuleIntegrityService
+        await ModuleIntegrityService.validate_resource_field_can_be_modified_or_deleted(
+            db=db,
+            resource_id=ver.organization_resource_id,
+            version_id=ver.id,
+            schema_fields_new=payload["schema_fields"],
+            schema_fields_old=ver.schema_fields or [],
+            organization_id=org.id,
+        )
+
         ver.schema_fields = payload["schema_fields"]
         flag_modified(ver, "schema_fields")
     if "settings" in payload:
@@ -1925,6 +1937,15 @@ async def delete_workspace_resource_version(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Action refusée : Impossible de supprimer la version v{ver.version_number} car elle est {ver.status} (scellée). Seuls les brouillons peuvent être supprimés pour préserver l'intégrité."
         )
+
+    # Contrôle strict d'intégrité : vérifier qu'aucune autre ressource ou formulaire n'utilise cette version
+    from app.services.plugin.module_integrity_service import ModuleIntegrityService
+    await ModuleIntegrityService.validate_resource_version_can_be_deleted(
+        db=db,
+        resource_id=resource_id,
+        version_id=version_id,
+        organization_id=org.id,
+    )
 
     # 1. Supprimer tous les items associés à cette version directement en base
     await db.execute(
@@ -2251,6 +2272,16 @@ async def update_workspace_resource_item(
             detail="La modification d'enregistrements est désactivée par la gouvernance."
         )
 
+    # Contrôle strict d'intégrité référentielle : aucun enregistrement utilisé par une autre ressource ou formulaire ne peut être modifié
+    from app.services.plugin.module_integrity_service import ModuleIntegrityService
+    await ModuleIntegrityService.validate_resource_row_can_be_modified_or_deleted(
+        db=db,
+        resource_id=res.id,
+        item_id=item.id,
+        organization_id=org.id,
+        is_delete=False,
+    )
+
     excluded_fields = set(gov.get("excluded_record_edit_fields", []))
     incoming = payload.get("data") if isinstance(payload.get("data"), dict) else payload
     current_data = dict(item.data or {})
@@ -2364,6 +2395,16 @@ async def delete_workspace_resource_item(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="La suppression d'enregistrements est désactivée par la gouvernance."
         )
+
+    # Contrôle strict d'intégrité référentielle : aucun enregistrement utilisé par une autre ressource ou formulaire ne peut être supprimé
+    from app.services.plugin.module_integrity_service import ModuleIntegrityService
+    await ModuleIntegrityService.validate_resource_row_can_be_modified_or_deleted(
+        db=db,
+        resource_id=res.id,
+        item_id=item.id,
+        organization_id=org.id,
+        is_delete=True,
+    )
 
     if item_ver:
         v_m = dict(item_ver.metrics or {})

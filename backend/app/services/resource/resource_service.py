@@ -1124,6 +1124,16 @@ class ResourceService:
         if "changelog" in update_dict and update_dict["changelog"] is not None:
             version_obj.changelog = update_dict["changelog"]
         if "schema_fields" in update_dict and update_dict["schema_fields"] is not None:
+            # Contrôle strict d'intégrité référentielle
+            from app.services.plugin.module_integrity_service import ModuleIntegrityService
+            await ModuleIntegrityService.validate_resource_field_can_be_modified_or_deleted(
+                db=db,
+                resource_id=resource_id,
+                version_id=version_id,
+                schema_fields_new=list(update_dict["schema_fields"]),
+                schema_fields_old=version_obj.schema_fields or [],
+                organization_id=getattr(resource, "organization_id", None),
+            )
             version_obj.schema_fields = list(update_dict["schema_fields"])
             flag_modified(version_obj, "schema_fields")
         if "settings" in update_dict and update_dict["settings"] is not None:
@@ -1166,6 +1176,15 @@ class ResourceService:
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Sécurité de versionnage : Impossible de supprimer la version v{version_num} car elle est publiée. Une version publiée est scellée et immuable pour préserver l'historique et l'intégrité des données. Seules les versions en brouillon peuvent être supprimées."
             )
+
+        # Contrôle strict d'intégrité : vérifier qu'aucune autre version de ressource ou formulaire n'utilise cette version
+        from app.services.plugin.module_integrity_service import ModuleIntegrityService
+        await ModuleIntegrityService.validate_resource_version_can_be_deleted(
+            db=db,
+            resource_id=resource_id,
+            version_id=version_id,
+            organization_id=getattr(resource, "organization_id", None),
+        )
 
         versions_count_res = await db.execute(
             select(func.count(ResourceVersion.id)).where(ResourceVersion.resource_id == resource_id)
@@ -1628,6 +1647,16 @@ class ResourceService:
 
         item_schema_fields = (ver_obj.schema_fields if ver_obj and ver_obj.schema_fields else None) or (resource.schema_fields or [])
 
+        # Contrôle strict d'intégrité : vérifier qu'aucun autre module n'utilise cet enregistrement
+        from app.services.plugin.module_integrity_service import ModuleIntegrityService
+        await ModuleIntegrityService.validate_resource_row_can_be_modified_or_deleted(
+            db=db,
+            resource_id=resource_id,
+            item_id=item_id,
+            organization_id=getattr(resource, "organization_id", None),
+            is_delete=False,
+        )
+
         await self._validate_item_data(
             db,
             resource,
@@ -1695,6 +1724,16 @@ class ResourceService:
                         status_code=status.HTTP_403_FORBIDDEN,
                         detail="La suppression de données dans cette version de ressource est désactivée par la politique de gouvernance."
                     )
+
+        # Contrôle strict d'intégrité : vérifier qu'aucun autre module n'utilise cet enregistrement
+        from app.services.plugin.module_integrity_service import ModuleIntegrityService
+        await ModuleIntegrityService.validate_resource_row_can_be_modified_or_deleted(
+            db=db,
+            resource_id=resource_id,
+            item_id=item_id,
+            organization_id=getattr(resource, "organization_id", None),
+            is_delete=True,
+        )
 
         await db.delete(item)
 
@@ -1767,6 +1806,16 @@ class ResourceService:
                             status_code=status.HTTP_403_FORBIDDEN,
                             detail=f"La suppression de l'enregistrement #{item.id} est interdite par la politique de gouvernance de la version v{ver_obj.version_number}."
                         )
+
+            # Contrôle strict d'intégrité référentielle
+            from app.services.plugin.module_integrity_service import ModuleIntegrityService
+            await ModuleIntegrityService.validate_resource_row_can_be_modified_or_deleted(
+                db=db,
+                resource_id=resource_id,
+                item_id=item.id,
+                organization_id=getattr(resource, "organization_id", None),
+                is_delete=True,
+            )
 
         deleted_ids = []
         for item in items_to_delete:
