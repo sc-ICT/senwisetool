@@ -2317,6 +2317,64 @@ async def publish_workspace_project_version(
     )
 
 
+@router.get("/organization/workspace/{module_type}/{module_id}/versions/{version_id}/publication-tree")
+async def get_workspace_module_publication_tree(
+    module_type: str,
+    module_id: int,
+    version_id: int,
+    org_id: Optional[int] = Query(None),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    [Espace Organisation] Inspecte l'arbre de dépendances d'une version native
+    en vue de la configuration du draft de publication interactif.
+    """
+    org = await _resolve_user_organization(db, current_user, org_id)
+    if not org:
+        raise HTTPException(status_code=404, detail="Organisation introuvable.")
+
+    from app.services.plugin.organization_publication_service import OrganizationPublicationService
+    return await OrganizationPublicationService.get_publication_dependency_tree(
+        db=db,
+        module_type=module_type,
+        module_id=module_id,
+        version_id=version_id,
+        organization_id=org.id,
+    )
+
+
+@router.post("/organization/workspace/{module_type}/{module_id}/versions/{version_id}/publish-tree")
+async def publish_workspace_module_tree(
+    module_type: str,
+    module_id: int,
+    version_id: int,
+    plan: Dict[str, Any] = Body(...),
+    org_id: Optional[int] = Query(None),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    [Espace Organisation] Exécute le plan de publication configuré sous forme d'arbre.
+    Ordonne les publications de bas en haut (feuilles d'abord), réutilise les publications
+    existantes spécifiées et lie certifié l'ensemble des modules.
+    """
+    org = await _resolve_user_organization(db, current_user, org_id)
+    if not org:
+        raise HTTPException(status_code=404, detail="Organisation introuvable.")
+
+    from app.services.plugin.organization_publication_service import OrganizationPublicationService
+    return await OrganizationPublicationService.execute_publication_tree(
+        db=db,
+        module_type=module_type,
+        module_id=module_id,
+        version_id=version_id,
+        organization_id=org.id,
+        user_id=current_user.id,
+        tree_plan=plan,
+    )
+
+
 @router.post("/organization/workspace/resources/{resource_id}/versions/{version_id}/activate")
 async def activate_workspace_resource_version(
     resource_id: int,

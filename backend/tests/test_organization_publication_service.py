@@ -1,6 +1,7 @@
 import pytest
 from datetime import datetime
 from fastapi import HTTPException
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.user.user import User, UserRole, UserStatus
 from app.models.organization.organization import Organization
@@ -328,3 +329,232 @@ async def test_organization_publication_and_cascade(db_session: AsyncSession):
     assert pub_camp.target_projects[0]["version_id"] != proj_v1.id
     # Vérifier que target_forms a été mis à jour vers le formulaire publié
     assert pub_camp.target_forms[0]["version_id"] != form_v1.id
+
+
+@pytest.mark.asyncio
+async def test_publication_tree_inspection_and_execution(db_session: AsyncSession):
+    db = db_session
+    uid = int(datetime.now().timestamp() * 1000) + 99
+
+    user = User(
+        email=f"tree_user_{uid}@test.com",
+        username=f"tree_user_{uid}",
+        hashed_password="hash",
+        full_name="Tree Tester",
+        role=UserRole.ADMIN_ORG,
+        status=UserStatus.ACTIVE,
+    )
+    db.add(user)
+    await db.flush()
+
+    org = Organization(
+        name=f"Org Tree {uid}",
+        code=f"org_tree_{uid}",
+        owner_id=user.id,
+        country="Sénégal",
+        region="Dakar",
+        city="Dakar",
+        address="Almadies",
+        postal_code="10000",
+        type="ENTERPRISE",
+        sector="AGRITECH",
+        contact_email=f"tree_{uid}@test.com",
+        phone="+221770000001",
+        status="active",
+    )
+    db.add(org)
+    await db.flush()
+
+    org_plug = OrganizationPlugin(
+        organization_ids=[org.id],
+        user_ids=[user.id],
+        name="Tree Plugin",
+        code=f"tree_plugin_{uid}",
+        category="agriculture",
+        status="active",
+    )
+    db.add(org_plug)
+    await db.flush()
+
+    opv = OrganizationPluginVersion(
+        organization_plugin_id=org_plug.id,
+        organization_ids=[org.id],
+        user_ids=[user.id],
+        version_number="1.0.0",
+        status="active",
+        changelog="init",
+    )
+    db.add(opv)
+    await db.flush()
+
+    # Ressource Cible (Sections)
+    res_sections = OrganizationResource(
+        organization_id=org.id,
+        organization_plugin_version_id=opv.id,
+        name="Sections Test",
+        code=f"sections_{uid}",
+        status="active",
+        schema_fields=[
+            {"name": "code_section", "label": "Code Section", "type": "text"},
+            {"name": "titre", "label": "Titre", "type": "text"},
+        ],
+    )
+    db.add(res_sections)
+    await db.flush()
+
+    sections_v1 = OrganizationResourceVersion(
+        organization_id=org.id,
+        organization_resource_id=res_sections.id,
+        organization_plugin_version_id=opv.id,
+        version_number="1.0.0",
+        status="native",
+        schema_fields=[
+            {"name": "code_section", "label": "Code Section", "type": "text"},
+            {"name": "titre", "label": "Titre", "type": "text"},
+        ],
+    )
+    db.add(sections_v1)
+    await db.flush()
+
+    # Ressource Source (Exigences) liée à Sections via relation
+    res_exigences = OrganizationResource(
+        organization_id=org.id,
+        organization_plugin_version_id=opv.id,
+        name="Exigences Test",
+        code=f"exigences_{uid}",
+        status="active",
+        schema_fields=[
+            {"name": "code_exigence", "label": "Code Exigence", "type": "text"},
+            {
+                "name": "section_id",
+                "label": "Section Associée",
+                "type": "relation",
+                "relation_type": "many_to_one",
+                "target_resource_id": res_sections.id,
+                "target_resource_code": res_sections.code,
+            },
+        ],
+    )
+    db.add(res_exigences)
+    await db.flush()
+
+    exigences_v1 = OrganizationResourceVersion(
+        organization_id=org.id,
+        organization_resource_id=res_exigences.id,
+        organization_plugin_version_id=opv.id,
+        version_number="1.0.0",
+        status="native",
+        schema_fields=[
+            {"name": "code_exigence", "label": "Code Exigence", "type": "text"},
+            {
+                "name": "section_id",
+                "label": "Section Associée",
+                "type": "relation",
+                "relation_type": "many_to_one",
+                "target_resource_id": res_sections.id,
+                "target_resource_code": res_sections.code,
+            },
+        ],
+    )
+    db.add(exigences_v1)
+    await db.flush()
+
+    # 1. Tester l'inspection de l'arbre
+    tree = await OrganizationPublicationService.get_publication_dependency_tree(
+        db=db,
+        module_type="resource",
+        module_id=res_exigences.id,
+        version_id=exigences_v1.id,
+        organization_id=org.id,
+    )
+
+    assert tree["node_id"] == f"resource_{res_exigences.id}_{exigences_v1.id}"
+    assert tree["has_dependencies"] is True
+    assert len(tree["dependencies"]) == 1
+    dep_sections = tree["dependencies"][0]
+    assert dep_sections["module_id"] == res_sections.id
+    assert dep_sections["field_context"]["field_name"] == "section_id"
+    assert dep_sections["has_published_versions"] is False
+
+    # 2. Exécuter un plan avec "action": "new" pour Sections
+    plan = {
+        "node_id": tree["node_id"],
+        "module_type": "resource",
+        "module_id": res_exigences.id,
+        "version_id": exigences_v1.id,
+        "action": "new",
+        "dependencies": [
+            {
+                "node_id": dep_sections["node_id"],
+                "module_type": "resource",
+                "module_id": res_sections.id,
+                "version_id": sections_v1.id,
+                "action": "new",
+                "dependencies": [],
+            }
+        ],
+    }
+
+    res_plan = await OrganizationPublicationService.execute_publication_tree(
+        db=db,
+        module_type="resource",
+        module_id=res_exigences.id,
+        version_id=exigences_v1.id,
+        organization_id=org.id,
+        user_id=user.id,
+        tree_plan=plan,
+    )
+
+    assert res_plan["success"] is True
+    assert res_plan["summary"]["created_count"] == 2
+    assert res_plan["summary"]["reused_count"] == 0
+    root_pub_id = res_plan["root_published_version"]["id"]
+
+    # Recharger la version publiée créée pour exigences
+    stmt = select(OrganizationResourceVersion).where(OrganizationResourceVersion.id == root_pub_id)
+    saved_root = (await db.execute(stmt)).scalars().first()
+    assert saved_root.status == "published"
+    assert saved_root.publication_number == 1
+    assert saved_root.version_number == "1.0.0 / 1"
+    # Vérifier le lien traçable Git-like dans settings["published_dependencies"]
+    pub_deps = saved_root.settings.get("published_dependencies") or []
+    assert len(pub_deps) == 1
+    assert pub_deps[0]["module_id"] == res_sections.id
+    assert pub_deps[0]["action_taken"] == "new"
+    sections_pub_vid = pub_deps[0]["version_id"]
+
+    # 3. Maintenant que Sections a une version publiée existante (sections_pub_vid),
+    # créer une deuxième publication pour exigences en choisissant "action": "existing" pour Sections !
+    plan_existing = {
+        "node_id": tree["node_id"],
+        "module_type": "resource",
+        "module_id": res_exigences.id,
+        "version_id": exigences_v1.id,
+        "action": "new",
+        "dependencies": [
+            {
+                "node_id": dep_sections["node_id"],
+                "module_type": "resource",
+                "module_id": res_sections.id,
+                "version_id": sections_v1.id,
+                "action": "existing",
+                "selected_version_id": sections_pub_vid,
+                "dependencies": [],
+            }
+        ],
+    }
+
+    res_plan_existing = await OrganizationPublicationService.execute_publication_tree(
+        db=db,
+        module_type="resource",
+        module_id=res_exigences.id,
+        version_id=exigences_v1.id,
+        organization_id=org.id,
+        user_id=user.id,
+        tree_plan=plan_existing,
+    )
+
+    assert res_plan_existing["success"] is True
+    assert res_plan_existing["summary"]["created_count"] == 1  # Seul Exigences a été créé !
+    assert res_plan_existing["summary"]["reused_count"] == 1   # Sections a été réutilisé !
+    assert res_plan_existing["root_published_version"]["version_number"] == "1.0.0 / 2"
