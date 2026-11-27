@@ -73,7 +73,7 @@ class OrganizationCampaignVersion(Base):
 
     # Identiques à CampaignVersion
     version_number = Column(String(50), nullable=False, index=True)
-    status = Column(String(50), nullable=False, default="published", index=True)
+    status = Column(String(50), nullable=False, default="native", index=True)
     description = Column(Text, nullable=True)
     objectives = Column(Text, nullable=True)
     targets = Column(JSON, nullable=True, default=dict)
@@ -86,6 +86,9 @@ class OrganizationCampaignVersion(Base):
     changelog = Column(Text, nullable=True)
     metrics = Column(JSON, nullable=True, default=dict)
     template_governance = Column(JSON, nullable=True, default=dict)
+    publication_number = Column(Integer, nullable=True, index=True)
+    origin_version_id = Column(Integer, ForeignKey("organization_campaign_versions.id", ondelete="SET NULL"), nullable=True, index=True)
+    published_at = Column(DateTime(timezone=True), nullable=True)
 
     # Paramètres et configurations
     settings = Column(JSON, nullable=False, default=dict)

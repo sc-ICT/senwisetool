@@ -69,11 +69,13 @@ class OrganizationFormVersion(Base):
 
     # Identiques à FormVersion
     version_number = Column(String(50), nullable=False, index=True)
-    status = Column(String(50), nullable=False, default="published", index=True)
+    status = Column(String(50), nullable=False, default="native", index=True)
     description = Column(Text, nullable=True)
     form_type = Column(String(50), nullable=False, default="standard")
     template_governance = Column(JSON, nullable=True, default=dict)
     published_at = Column(DateTime(timezone=True), nullable=True)
+    publication_number = Column(Integer, nullable=True, index=True)
+    origin_version_id = Column(Integer, ForeignKey("organization_form_versions.id", ondelete="SET NULL"), nullable=True, index=True)
 
     # Paramètres et configurations
     settings = Column(JSON, nullable=False, default=dict)

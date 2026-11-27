@@ -1746,27 +1746,95 @@ async def publish_workspace_resource_version(
     current_user: User = Depends(get_current_user),
 ):
     """
-    [Espace Organisation] Publie et scelle une version brouillon d'une ressource souveraine.
+    [Espace Organisation] Crée une copie publiée immuable d'une version de ressource
+    (numérotée v{version} / {n}) avec cascade sur les relations.
     """
     org = await _resolve_user_organization(db, current_user, org_id)
     if not org:
         raise HTTPException(status_code=404, detail="Organisation introuvable.")
 
-    ver_stmt = select(OrganizationResourceVersion).options(selectinload(OrganizationResourceVersion.items)).where(
-        OrganizationResourceVersion.id == version_id,
-        OrganizationResourceVersion.organization_id == org.id,
+    from app.services.plugin.organization_publication_service import OrganizationPublicationService
+    pub_ver = await OrganizationPublicationService.publish_resource_version(
+        db=db,
+        resource_id=resource_id,
+        version_id=version_id,
+        organization_id=org.id,
+        user_id=current_user.id,
     )
-    ver = (await db.execute(ver_stmt)).scalars().first()
-    if not ver:
-        raise HTTPException(status_code=404, detail="Version introuvable.")
-
-    ver.status = "published"
-    flag_modified(ver, "status")
     await db.commit()
 
     return await get_workspace_resource_detail(
-        resource_id=ver.organization_resource_id,
-        version_id=ver.id,
+        resource_id=pub_ver.organization_resource_id,
+        version_id=pub_ver.id,
+        org_id=org.id,
+        db=db,
+        current_user=current_user,
+    )
+
+
+@router.post("/organization/workspace/forms/{form_id}/versions/{version_id}/publish")
+async def publish_workspace_form_version(
+    form_id: int,
+    version_id: int,
+    org_id: Optional[int] = Query(None),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    [Espace Organisation] Crée une copie publiée immuable d'une version de formulaire
+    (numérotée v{version} / {n}) avec cascade sur toutes les ressources et formulaires liés.
+    """
+    org = await _resolve_user_organization(db, current_user, org_id)
+    if not org:
+        raise HTTPException(status_code=404, detail="Organisation introuvable.")
+
+    from app.services.plugin.organization_publication_service import OrganizationPublicationService
+    pub_ver = await OrganizationPublicationService.publish_form_version(
+        db=db,
+        form_id=form_id,
+        version_id=version_id,
+        organization_id=org.id,
+        user_id=current_user.id,
+    )
+    await db.commit()
+
+    return await get_workspace_form_detail(
+        form_id=pub_ver.organization_form_id,
+        version_id=pub_ver.id,
+        org_id=org.id,
+        db=db,
+        current_user=current_user,
+    )
+
+
+@router.post("/organization/workspace/projects/{project_id}/versions/{version_id}/publish")
+async def publish_workspace_project_version(
+    project_id: int,
+    version_id: int,
+    org_id: Optional[int] = Query(None),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    [Espace Organisation] Crée une copie publiée immuable d'une version de projet
+    (numérotée v{version} / {n}) avec cascade sur tous les formulaires rattachés.
+    """
+    org = await _resolve_user_organization(db, current_user, org_id)
+    if not org:
+        raise HTTPException(status_code=404, detail="Organisation introuvable.")
+
+    from app.services.plugin.organization_publication_service import OrganizationPublicationService
+    pub_ver = await OrganizationPublicationService.publish_project_version(
+        db=db,
+        project_id=project_id,
+        version_id=version_id,
+        organization_id=org.id,
+        user_id=current_user.id,
+    )
+    await db.commit()
+
+    return await get_workspace_project_detail(
+        project_id=pub_ver.organization_project_id,
         org_id=org.id,
         db=db,
         current_user=current_user,
@@ -2249,6 +2317,13 @@ async def update_workspace_resource_item(
         item_ver = res.versions[0]
 
     gov = (item_ver.template_governance if item_ver else {}) or res.parameters.get("template_governance", {})
+
+    # Règle d'immuabilité absolue des publications scellées
+    if item_ver and (item_ver.status == "published" or getattr(item_ver, "publication_number", None) is not None or "/" in str(item_ver.version_number)):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Action refusée : La version « {item_ver.version_number} » est une publication scellée et strictement immuable. Les enregistrements ne peuvent pas être modifiés."
+        )
     allow_update = (
         gov.get("allow_data_update") is not False
         and gov.get("allow_edit") is not False
@@ -2369,6 +2444,13 @@ async def delete_workspace_resource_item(
         item_ver = next((v for v in (res.versions or []) if v.id == item.organization_resource_version_id), None)
 
     gov = (item_ver.template_governance if item_ver else {}) or res.parameters.get("template_governance", {})
+
+    # Règle d'immuabilité absolue des publications scellées
+    if item_ver and (item_ver.status == "published" or getattr(item_ver, "publication_number", None) is not None or "/" in str(item_ver.version_number)):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Action refusée : La version « {item_ver.version_number} » est une publication scellée et strictement immuable. Les enregistrements ne peuvent pas être supprimés."
+        )
     allow_deletion = (
         gov.get("allow_data_deletion") is True
         or gov.get("allow_delete") is True
@@ -4455,37 +4537,28 @@ async def publish_workspace_campaign_version(
     current_user: User = Depends(get_current_user),
 ):
     """
-    [Espace Organisation] Publie une version brouillon de campagne souveraine et la scelle.
+    [Espace Organisation] Crée une copie publiée immuable d'une version de campagne
+    (numérotée v{version} / {n}) avec cascade sur tous les projets et formulaires dépendants.
     """
     org = await _resolve_user_organization(db, current_user, org_id)
     if not org:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organisation introuvable.")
 
-    c_stmt = select(OrganizationCampaign).options(
-        selectinload(OrganizationCampaign.versions)
-    ).where(
-        (OrganizationCampaign.id == campaign_id) | (OrganizationCampaign.source_campaign_id == campaign_id),
-        OrganizationCampaign.organization_id == org.id
+    from app.services.plugin.organization_publication_service import OrganizationPublicationService
+    pub_ver = await OrganizationPublicationService.publish_campaign_version(
+        db=db,
+        campaign_id=campaign_id,
+        version_id=version_id,
+        organization_id=org.id,
+        user_id=current_user.id,
     )
-    camp = (await db.execute(c_stmt)).scalars().first()
-    if not camp:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Campagne souveraine introuvable.")
-
-    target_ver = next((v for v in (camp.versions or []) if v.id == version_id), None)
-    if not target_ver:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Version introuvable.")
-
-    target_ver.status = "open"
-    camp.version = target_ver.version_number
-    if camp.status == "draft":
-        camp.status = "open"
-
-    flag_modified(target_ver, "status")
-    flag_modified(camp, "version")
-    flag_modified(camp, "status")
     await db.commit()
 
-    return {"success": True, "message": f"Version v{target_ver.version_number} publiée avec succès."}
+    return {"success": True, "message": f"Version {pub_ver.version_number} publiée avec succès.", "version": {
+        "id": pub_ver.id,
+        "version_number": pub_ver.version_number,
+        "status": pub_ver.status,
+    }}
 
 
 @router.post("/organization/workspace/campaigns/{campaign_id}/versions/{version_id}/activate")
