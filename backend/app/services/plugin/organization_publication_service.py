@@ -830,6 +830,7 @@ class OrganizationPublicationService:
             v_id: int,
             field_ctx: Optional[Dict[str, Any]] = None,
             ancestors: Optional[Set[Tuple[str, int]]] = None,
+            tree_path: str = "root",
         ) -> Optional[Dict[str, Any]]:
             if ancestors is None:
                 ancestors = set()
@@ -840,7 +841,8 @@ class OrganizationPublicationService:
             curr_ancestors.add(node_key)
 
             node_data: Dict[str, Any] = {
-                "node_id": f"{m_type}_{m_id}_{v_id}",
+                "node_id": f"{tree_path}_{m_type}_{m_id}_{v_id}",
+                "tree_path": tree_path,
                 "module_type": m_type,
                 "module_id": m_id,
                 "module_name": f"{m_type.capitalize()} #{m_id}",
@@ -936,6 +938,7 @@ class OrganizationPublicationService:
                                             "relation_type": f.get("relation_type", "many_to_one"),
                                         },
                                         ancestors=curr_ancestors,
+                                        tree_path=f"{tree_path}.{len(child_deps)}",
                                     )
                                     if child_node:
                                         child_deps.append(child_node)
@@ -1013,6 +1016,7 @@ class OrganizationPublicationService:
                                             "type": "resource_binding",
                                         },
                                         ancestors=curr_ancestors,
+                                        tree_path=f"{tree_path}.{len(child_deps)}",
                                     )
                                     if c_node:
                                         child_deps.append(c_node)
@@ -1045,6 +1049,7 @@ class OrganizationPublicationService:
                                             "type": "cross_form_lookup",
                                         },
                                         ancestors=curr_ancestors,
+                                        tree_path=f"{tree_path}.{len(child_deps)}",
                                     )
                                     if c_node:
                                         child_deps.append(c_node)
@@ -1117,6 +1122,7 @@ class OrganizationPublicationService:
                                             "type": "project_form",
                                         },
                                         ancestors=curr_ancestors,
+                                        tree_path=f"{tree_path}.{len(child_deps)}",
                                     )
                                     if c_node:
                                         child_deps.append(c_node)
@@ -1188,6 +1194,7 @@ class OrganizationPublicationService:
                                             "type": "campaign_project",
                                         },
                                         ancestors=curr_ancestors,
+                                        tree_path=f"{tree_path}.{len(child_deps)}",
                                     )
                                     if c_node:
                                         child_deps.append(c_node)
@@ -1213,6 +1220,7 @@ class OrganizationPublicationService:
                                             "type": "campaign_form",
                                         },
                                         ancestors=curr_ancestors,
+                                        tree_path=f"{tree_path}.{len(child_deps)}",
                                     )
                                     if c_node:
                                         child_deps.append(c_node)
@@ -1261,6 +1269,37 @@ class OrganizationPublicationService:
         norm_type = str(module_type).lower().rstrip("s")
         if norm_type not in ("resource", "form", "project", "campaign"):
             norm_type = "resource"
+
+        # Identifier la version de plugin de la racine pour rattacher tout le lot scellé ensemble
+        root_opv_id = None
+        if norm_type == "resource":
+            root_opv_id = await db.scalar(
+                select(OrganizationResourceVersion.organization_plugin_version_id).where(
+                    OrganizationResourceVersion.id == version_id,
+                    OrganizationResourceVersion.organization_id == organization_id,
+                )
+            )
+        elif norm_type == "form":
+            root_opv_id = await db.scalar(
+                select(OrganizationFormVersion.organization_plugin_version_id).where(
+                    OrganizationFormVersion.id == version_id,
+                    OrganizationFormVersion.organization_id == organization_id,
+                )
+            )
+        elif norm_type == "project":
+            root_opv_id = await db.scalar(
+                select(OrganizationProjectVersion.organization_plugin_version_id).where(
+                    OrganizationProjectVersion.id == version_id,
+                    OrganizationProjectVersion.organization_id == organization_id,
+                )
+            )
+        elif norm_type == "campaign":
+            root_opv_id = await db.scalar(
+                select(OrganizationCampaignVersion.organization_plugin_version_id).where(
+                    OrganizationCampaignVersion.id == version_id,
+                    OrganizationCampaignVersion.organization_id == organization_id,
+                )
+            )
 
         created_versions = []
         reused_versions = []
@@ -1397,9 +1436,10 @@ class OrganizationPublicationService:
                 new_settings = copy.deepcopy(orig_v.settings or {})
                 new_settings["published_dependencies"] = resolved_child_records
 
+                target_opv_id = root_opv_id or orig_v.organization_plugin_version_id
                 pub_res_v = OrganizationResourceVersion(
                     organization_resource_id=orig_v.organization_resource_id,
-                    organization_plugin_version_id=orig_v.organization_plugin_version_id,
+                    organization_plugin_version_id=target_opv_id,
                     source_resource_version_id=orig_v.source_resource_version_id,
                     organization_id=organization_id,
                     downloaded_by_user_id=user_id or orig_v.downloaded_by_user_id,
@@ -1424,7 +1464,7 @@ class OrganizationPublicationService:
                     db.add(OrganizationResourceItem(
                         organization_resource_id=itm.organization_resource_id,
                         organization_resource_version_id=pub_res_v.id,
-                        organization_plugin_version_id=itm.organization_plugin_version_id,
+                        organization_plugin_version_id=target_opv_id,
                         source_resource_item_id=itm.source_resource_item_id,
                         organization_id=organization_id,
                         downloaded_by_user_id=user_id or itm.downloaded_by_user_id,
@@ -1468,9 +1508,10 @@ class OrganizationPublicationService:
                 new_settings = copy.deepcopy(orig_v.settings or {})
                 new_settings["published_dependencies"] = resolved_child_records
 
+                target_opv_id = root_opv_id or orig_v.organization_plugin_version_id
                 pub_form_v = OrganizationFormVersion(
                     organization_form_id=orig_v.organization_form_id,
-                    organization_plugin_version_id=orig_v.organization_plugin_version_id,
+                    organization_plugin_version_id=target_opv_id,
                     source_form_version_id=orig_v.source_form_version_id,
                     organization_id=organization_id,
                     downloaded_by_user_id=user_id or orig_v.downloaded_by_user_id,
@@ -1495,7 +1536,7 @@ class OrganizationPublicationService:
                     new_sec = OrganizationFormSection(
                         organization_form_id=s.organization_form_id,
                         organization_form_version_id=pub_form_v.id,
-                        organization_plugin_version_id=s.organization_plugin_version_id,
+                        organization_plugin_version_id=target_opv_id,
                         source_form_section_id=s.source_form_section_id,
                         organization_id=organization_id,
                         downloaded_by_user_id=user_id or s.downloaded_by_user_id,
@@ -1544,7 +1585,7 @@ class OrganizationPublicationService:
                         organization_form_id=q.organization_form_id,
                         organization_form_version_id=pub_form_v.id,
                         organization_form_section_id=old_sec_to_new_sec.get(q.organization_form_section_id),
-                        organization_plugin_version_id=q.organization_plugin_version_id,
+                        organization_plugin_version_id=target_opv_id,
                         source_form_question_id=q.source_form_question_id,
                         organization_id=organization_id,
                         downloaded_by_user_id=user_id or q.downloaded_by_user_id,
@@ -1606,9 +1647,10 @@ class OrganizationPublicationService:
                 new_settings["attached_form_versions"] = new_attached
                 new_settings["published_dependencies"] = resolved_child_records
 
+                target_opv_id = root_opv_id or orig_v.organization_plugin_version_id
                 pub_proj_v = OrganizationProjectVersion(
                     organization_project_id=orig_v.organization_project_id,
-                    organization_plugin_version_id=orig_v.organization_plugin_version_id,
+                    organization_plugin_version_id=target_opv_id,
                     source_project_version_id=orig_v.source_project_version_id,
                     organization_id=organization_id,
                     downloaded_by_user_id=user_id or orig_v.downloaded_by_user_id,
@@ -1680,9 +1722,10 @@ class OrganizationPublicationService:
                 new_settings = copy.deepcopy(orig_v.settings or {})
                 new_settings["published_dependencies"] = resolved_child_records
 
+                target_opv_id = root_opv_id or orig_v.organization_plugin_version_id
                 pub_camp_v = OrganizationCampaignVersion(
                     organization_campaign_id=orig_v.organization_campaign_id,
-                    organization_plugin_version_id=orig_v.organization_plugin_version_id,
+                    organization_plugin_version_id=target_opv_id,
                     source_campaign_version_id=orig_v.source_campaign_version_id,
                     organization_id=organization_id,
                     downloaded_by_user_id=user_id or orig_v.downloaded_by_user_id,

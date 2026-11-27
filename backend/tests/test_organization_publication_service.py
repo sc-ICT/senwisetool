@@ -468,10 +468,11 @@ async def test_publication_tree_inspection_and_execution(db_session: AsyncSessio
         organization_id=org.id,
     )
 
-    assert tree["node_id"] == f"resource_{res_exigences.id}_{exigences_v1.id}"
+    assert tree["node_id"] == f"root_resource_{res_exigences.id}_{exigences_v1.id}"
     assert tree["has_dependencies"] is True
     assert len(tree["dependencies"]) == 1
     dep_sections = tree["dependencies"][0]
+    assert dep_sections["node_id"] == f"root.0_resource_{res_sections.id}_{sections_v1.id}"
     assert dep_sections["module_id"] == res_sections.id
     assert dep_sections["field_context"]["field_name"] == "section_id"
     assert dep_sections["has_published_versions"] is False
