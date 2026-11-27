@@ -1162,6 +1162,7 @@ async def get_workspace_summary(
                 "version": r.version,
                 "icon": r.icon,
                 "cover_image_url": r.cover_image_url,
+                "schema_fields": r.schema_fields or [],
                 "metrics": r.metrics or {},
                 "parameters": r.parameters or {},
                 "settings": r.settings or {},
@@ -1171,10 +1172,14 @@ async def get_workspace_summary(
                         "version_number": rv.version_number,
                         "status": rv.status,
                         "description": rv.description,
+                        "schema_fields": rv.schema_fields or [],
                         "metrics": rv.metrics or {},
                         "template_governance": rv.template_governance or {},
                         "parameters": rv.parameters or {},
                         "settings": rv.settings or {},
+                        "publication_number": rv.publication_number,
+                        "origin_version_id": rv.origin_version_id,
+                        "published_at": rv.published_at.isoformat() if rv.published_at else None,
                     }
                     for rv in (r.versions or [])
                 ],
@@ -1395,6 +1400,7 @@ async def get_workspace_feature(
                 "version": r.version,
                 "icon": r.icon,
                 "cover_image_url": r.cover_image_url,
+                "schema_fields": r.schema_fields or [],
                 "metrics": r.metrics or {},
                 "parameters": r.parameters or {},
                 "settings": r.settings or {},
@@ -1404,10 +1410,14 @@ async def get_workspace_feature(
                         "version_number": rv.version_number,
                         "status": rv.status,
                         "description": rv.description,
+                        "schema_fields": rv.schema_fields or [],
                         "metrics": rv.metrics or {},
                         "template_governance": rv.template_governance or {},
                         "parameters": rv.parameters or {},
                         "settings": rv.settings or {},
+                        "publication_number": rv.publication_number,
+                        "origin_version_id": rv.origin_version_id,
+                        "published_at": rv.published_at.isoformat() if rv.published_at else None,
                     }
                     for rv in (r.versions or [])
                 ],
@@ -1502,10 +1512,16 @@ async def get_workspace_resource_detail(
         )
 
     stmt = select(OrganizationResource).options(selectinload(OrganizationResource.versions)).where(
-        (OrganizationResource.id == resource_id) | (OrganizationResource.source_resource_id == resource_id),
+        OrganizationResource.id == resource_id,
         OrganizationResource.organization_id == org.id
     )
     res = (await db.execute(stmt)).scalars().first()
+    if not res:
+        stmt_src = select(OrganizationResource).options(selectinload(OrganizationResource.versions)).where(
+            OrganizationResource.source_resource_id == resource_id,
+            OrganizationResource.organization_id == org.id
+        )
+        res = (await db.execute(stmt_src)).scalars().first()
     if not res:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -1593,6 +1609,9 @@ async def get_workspace_resource_detail(
                     "template_governance": rv.template_governance or {},
                     "settings": rv.settings or {},
                     "parameters": rv.parameters or {},
+                    "publication_number": rv.publication_number,
+                    "origin_version_id": rv.origin_version_id,
+                    "published_at": rv.published_at.isoformat() if rv.published_at else None,
                     "created_at": rv.created_at.isoformat() if rv.created_at else None,
                 }
                 for rv in all_versions
@@ -1627,10 +1646,16 @@ async def clone_workspace_resource_version(
         )
 
     stmt_res = select(OrganizationResource).options(selectinload(OrganizationResource.versions)).where(
-        (OrganizationResource.id == resource_id) | (OrganizationResource.source_resource_id == resource_id),
+        OrganizationResource.id == resource_id,
         OrganizationResource.organization_id == org.id
     )
     res = (await db.execute(stmt_res)).scalars().first()
+    if not res:
+        stmt_src = select(OrganizationResource).options(selectinload(OrganizationResource.versions)).where(
+            OrganizationResource.source_resource_id == resource_id,
+            OrganizationResource.organization_id == org.id
+        )
+        res = (await db.execute(stmt_src)).scalars().first()
     if not res:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -2106,10 +2131,16 @@ async def get_workspace_resource_items(
         )
 
     stmt_res = select(OrganizationResource).options(selectinload(OrganizationResource.versions)).where(
-        (OrganizationResource.id == resource_id) | (OrganizationResource.source_resource_id == resource_id),
+        OrganizationResource.id == resource_id,
         OrganizationResource.organization_id == org.id
     )
     res = (await db.execute(stmt_res)).scalars().first()
+    if not res:
+        stmt_src = select(OrganizationResource).options(selectinload(OrganizationResource.versions)).where(
+            OrganizationResource.source_resource_id == resource_id,
+            OrganizationResource.organization_id == org.id
+        )
+        res = (await db.execute(stmt_src)).scalars().first()
     if not res:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -2181,10 +2212,16 @@ async def create_workspace_resource_item(
         )
 
     stmt_res = select(OrganizationResource).options(selectinload(OrganizationResource.versions)).where(
-        (OrganizationResource.id == resource_id) | (OrganizationResource.source_resource_id == resource_id),
+        OrganizationResource.id == resource_id,
         OrganizationResource.organization_id == org.id
     )
     res = (await db.execute(stmt_res)).scalars().first()
+    if not res:
+        stmt_src = select(OrganizationResource).options(selectinload(OrganizationResource.versions)).where(
+            OrganizationResource.source_resource_id == resource_id,
+            OrganizationResource.organization_id == org.id
+        )
+        res = (await db.execute(stmt_src)).scalars().first()
     if not res:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -2287,10 +2324,16 @@ async def update_workspace_resource_item(
         )
 
     stmt_res = select(OrganizationResource).options(selectinload(OrganizationResource.versions)).where(
-        (OrganizationResource.id == resource_id) | (OrganizationResource.source_resource_id == resource_id),
+        OrganizationResource.id == resource_id,
         OrganizationResource.organization_id == org.id
     )
     res = (await db.execute(stmt_res)).scalars().first()
+    if not res:
+        stmt_src = select(OrganizationResource).options(selectinload(OrganizationResource.versions)).where(
+            OrganizationResource.source_resource_id == resource_id,
+            OrganizationResource.organization_id == org.id
+        )
+        res = (await db.execute(stmt_src)).scalars().first()
     if not res:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -2417,10 +2460,16 @@ async def delete_workspace_resource_item(
         )
 
     stmt_res = select(OrganizationResource).options(selectinload(OrganizationResource.versions)).where(
-        (OrganizationResource.id == resource_id) | (OrganizationResource.source_resource_id == resource_id),
+        OrganizationResource.id == resource_id,
         OrganizationResource.organization_id == org.id
     )
     res = (await db.execute(stmt_res)).scalars().first()
+    if not res:
+        stmt_src = select(OrganizationResource).options(selectinload(OrganizationResource.versions)).where(
+            OrganizationResource.source_resource_id == resource_id,
+            OrganizationResource.organization_id == org.id
+        )
+        res = (await db.execute(stmt_src)).scalars().first()
     if not res:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
