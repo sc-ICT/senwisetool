@@ -3388,6 +3388,16 @@ async def get_workspace_form_detail(
     if "agent_monitoring" not in merged_settings and "agent_monitoring" in feature_params:
         merged_settings["agent_monitoring"] = feature_params["agent_monitoring"]
 
+    target_status = target_ver.status if target_ver else frm.status
+    target_is_pub = bool(
+        target_ver
+        and (
+            target_ver.status == "published"
+            or getattr(target_ver, "publication_number", None) is not None
+            or "/" in str(target_ver.version_number)
+        )
+    )
+
     return {
         "form": {
             "id": frm.id,
@@ -3398,8 +3408,8 @@ async def get_workspace_form_detail(
             "description": frm.description,
             "visibility": frm.visibility,
             "version": target_ver.version_number if target_ver else frm.version,
-            "status": "published",
-            "is_published": True,
+            "status": target_status,
+            "is_published": target_is_pub,
             "scoring_enabled": merged_settings.get("scoring_enabled", True),
             "scoring_scale": merged_settings.get("scoring_scale", "percentage_100"),
             "passing_score_percentage": merged_settings.get("passing_score_percentage", 80),
@@ -3417,7 +3427,13 @@ async def get_workspace_form_detail(
                 {
                     "id": v.id,
                     "version_number": v.version_number,
-                    "status": "published",
+                    "status": v.status,
+                    "publication_number": getattr(v, "publication_number", None),
+                    "is_published": bool(
+                        v.status == "published"
+                        or getattr(v, "publication_number", None) is not None
+                        or "/" in str(v.version_number)
+                    ),
                     "description": v.description,
                     "form_type": v.form_type,
                     "template_governance": v.template_governance or {},
@@ -3432,7 +3448,9 @@ async def get_workspace_form_detail(
             "current_version": {
                 "id": target_ver.id if target_ver else None,
                 "version_number": target_ver.version_number if target_ver else frm.version,
-                "status": "published",
+                "status": target_status,
+                "publication_number": getattr(target_ver, "publication_number", None) if target_ver else None,
+                "is_published": target_is_pub,
                 "description": target_ver.description if target_ver else None,
                 "form_type": target_ver.form_type if target_ver else "standard",
                 "template_governance": target_ver.template_governance if target_ver else {},
@@ -3627,6 +3645,12 @@ async def get_workspace_project_detail(
                 "id": v.id,
                 "version_number": v.version_number,
                 "status": v.status,
+                "publication_number": getattr(v, "publication_number", None),
+                "is_published": bool(
+                    v.status == "published"
+                    or getattr(v, "publication_number", None) is not None
+                    or "/" in str(v.version_number)
+                ),
                 "description": v.description,
                 "template_governance": v.template_governance or {},
                 "settings": v.settings or {},
@@ -3640,7 +3664,16 @@ async def get_workspace_project_detail(
         "current_version": {
             "id": target_ver.id if target_ver else None,
             "version_number": target_ver.version_number if target_ver else "1.0.0",
-            "status": target_ver.status if target_ver else "published",
+            "status": target_ver.status if target_ver else "draft",
+            "publication_number": getattr(target_ver, "publication_number", None) if target_ver else None,
+            "is_published": bool(
+                target_ver
+                and (
+                    target_ver.status == "published"
+                    or getattr(target_ver, "publication_number", None) is not None
+                    or "/" in str(target_ver.version_number)
+                )
+            ),
             "description": target_ver.description if target_ver else None,
             "template_governance": ver_gov,
             "settings": target_ver.settings if target_ver else {},

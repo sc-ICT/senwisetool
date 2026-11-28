@@ -482,24 +482,50 @@ class OrganizationPublicationService:
 
         # Cascade sur les formulaires rattachés
         new_settings = copy.deepcopy(origin_ver.settings or {})
-        attached_fvs = new_settings.get("attached_form_versions") or {}
-        new_attached_fvs = {}
-        for fid_str, fvid in attached_fvs.items():
-            try:
-                pub_fv = await cls.publish_form_version(
-                    db=db,
-                    form_id=int(fid_str),
-                    version_id=int(fvid),
-                    organization_id=organization_id,
-                    user_id=user_id,
-                    cascade_context=cascade_context,
-                )
-                new_attached_fvs[str(pub_fv.organization_form_id)] = pub_fv.id
-            except Exception as e:
-                logger.warning(f"Cascade publish attached form {fid_str} v{fvid}: {e}")
-                new_attached_fvs[fid_str] = fvid
-
-        new_settings["attached_form_versions"] = new_attached_fvs
+        raw_attached_fvs = new_settings.get("attached_form_versions")
+        if isinstance(raw_attached_fvs, dict):
+            new_attached_fvs = {}
+            for fid_str, fvid in raw_attached_fvs.items():
+                try:
+                    pub_fv = await cls.publish_form_version(
+                        db=db,
+                        form_id=int(fid_str),
+                        version_id=int(fvid),
+                        organization_id=organization_id,
+                        user_id=user_id,
+                        cascade_context=cascade_context,
+                    )
+                    new_attached_fvs[str(pub_fv.organization_form_id)] = pub_fv.id
+                except Exception as e:
+                    logger.warning(f"Cascade publish attached form {fid_str} v{fvid}: {e}")
+                    new_attached_fvs[fid_str] = fvid
+            new_settings["attached_form_versions"] = new_attached_fvs
+        elif isinstance(raw_attached_fvs, list):
+            new_attached_list = []
+            for item in raw_attached_fvs:
+                if isinstance(item, dict):
+                    item_copy = copy.deepcopy(item)
+                    fid = item.get("form_id") or item.get("id")
+                    fvid = item.get("form_version_id") or item.get("version_id")
+                    if fid:
+                        try:
+                            pub_fv = await cls.publish_form_version(
+                                db=db,
+                                form_id=int(fid),
+                                version_id=int(fvid) if fvid else None,
+                                organization_id=organization_id,
+                                user_id=user_id,
+                                cascade_context=cascade_context,
+                            )
+                            item_copy["form_version_id"] = pub_fv.id
+                            item_copy["version_number"] = pub_fv.version_number
+                            item_copy["status"] = pub_fv.status
+                        except Exception as e:
+                            logger.warning(f"Cascade publish attached form {fid}: {e}")
+                    new_attached_list.append(item_copy)
+                else:
+                    new_attached_list.append(item)
+            new_settings["attached_form_versions"] = new_attached_list
 
         pub_ver = OrganizationProjectVersion(
             organization_project_id=origin_ver.organization_project_id,
@@ -1099,13 +1125,40 @@ class OrganizationPublicationService:
 
                 child_deps = []
                 if ver_obj and ver_obj.settings:
-                    attached_forms = (ver_obj.settings or {}).get("attached_form_versions") or {}
-                    for fid_str, fvid in attached_forms.items():
+                    attached_fvs = (ver_obj.settings or {}).get("attached_form_versions")
+                    form_version_pairs = []
+                    if isinstance(attached_fvs, dict):
+                        for fid_str, fvid in attached_fvs.items():
+                            try:
+                                form_version_pairs.append((int(fid_str), int(fvid) if fvid else None))
+                            except (ValueError, TypeError):
+                                pass
+                    elif isinstance(attached_fvs, list):
+                        for item in attached_fvs:
+                            if isinstance(item, dict):
+                                fid = item.get("form_id") or item.get("id")
+                                fvid = item.get("form_version_id") or item.get("version_id")
+                                if fid is not None:
+                                    try:
+                                        form_version_pairs.append((int(fid), int(fvid) if fvid else None))
+                                    except (ValueError, TypeError):
+                                        pass
+                            elif isinstance(item, (int, str)) and str(item).isdigit():
+                                form_version_pairs.append((int(item), None))
+
+                    # Fallback vers attached_form_ids si aucun formulaire trouvé
+                    if not form_version_pairs:
+                        for fid in (ver_obj.settings or {}).get("attached_form_ids") or []:
+                            if isinstance(fid, (int, str)) and str(fid).isdigit():
+                                form_version_pairs.append((int(fid), None))
+
+                    for f_id_num, f_vid_num in form_version_pairs:
                         try:
-                            f_id_num = int(fid_str)
                             t_form = await cls._find_org_form(db, organization_id, f_id_num, None)
                             if t_form:
-                                t_ver = next((v for v in (t_form.versions or []) if v.id == int(fvid)), None)
+                                t_ver = None
+                                if f_vid_num:
+                                    t_ver = next((v for v in (t_form.versions or []) if v.id == f_vid_num), None)
                                 if not t_ver:
                                     t_ver = next(
                                         (v for v in (t_form.versions or []) if v.status != "published"),
@@ -1126,8 +1179,8 @@ class OrganizationPublicationService:
                                     )
                                     if c_node:
                                         child_deps.append(c_node)
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.warning(f"Error building child node for form {f_id_num}: {e}")
                 node_data["dependencies"] = child_deps
                 node_data["has_dependencies"] = len(child_deps) > 0
 
@@ -1640,11 +1693,28 @@ class OrganizationPublicationService:
                 )
 
                 new_settings = copy.deepcopy(orig_v.settings or {})
-                new_attached = {}
-                for fid_str, fvid in (new_settings.get("attached_form_versions") or {}).items():
-                    c_pub = child_version_map.get(f"form_{fid_str}")
-                    new_attached[fid_str] = c_pub.id if c_pub else fvid
-                new_settings["attached_form_versions"] = new_attached
+                raw_attached = new_settings.get("attached_form_versions")
+                if isinstance(raw_attached, dict):
+                    new_attached = {}
+                    for fid_str, fvid in raw_attached.items():
+                        c_pub = child_version_map.get(f"form_{fid_str}")
+                        new_attached[fid_str] = c_pub.id if c_pub else fvid
+                    new_settings["attached_form_versions"] = new_attached
+                elif isinstance(raw_attached, list):
+                    new_attached_list = []
+                    for item in raw_attached:
+                        if isinstance(item, dict):
+                            item_copy = copy.deepcopy(item)
+                            fid = item.get("form_id") or item.get("id")
+                            c_pub = child_version_map.get(f"form_{fid}") if fid else None
+                            if c_pub:
+                                item_copy["form_version_id"] = c_pub.id
+                                item_copy["version_number"] = c_pub.version_number
+                                item_copy["status"] = c_pub.status
+                            new_attached_list.append(item_copy)
+                        else:
+                            new_attached_list.append(item)
+                    new_settings["attached_form_versions"] = new_attached_list
                 new_settings["published_dependencies"] = resolved_child_records
 
                 target_opv_id = root_opv_id or orig_v.organization_plugin_version_id
